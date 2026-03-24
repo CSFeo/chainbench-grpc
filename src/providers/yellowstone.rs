@@ -162,6 +162,20 @@ async fn process_yellowstone_endpoint(
                                                 start_wallclock_ms,
                                             );
 
+                                            // Log first few observations for diagnostics
+                                            if transaction_count < 3 {
+                                                let abs_lat = tx_data.client_wallclock_ms - tx_data.timestamp_ms;
+                                                info!(
+                                                    endpoint = %endpoint_name,
+                                                    sig = %&signature[..16],
+                                                    server_ts_ms = tx_data.timestamp_ms,
+                                                    client_ts_ms = tx_data.client_wallclock_ms,
+                                                    abs_latency_ms = abs_lat,
+                                                    source = ?tx_data.timestamp_source,
+                                                    "Diagnostic: first observations"
+                                                );
+                                            }
+
                                             let updated = accumulator.record(
                                                 signature.clone(),
                                                 tx_data.clone(),

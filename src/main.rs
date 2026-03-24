@@ -17,6 +17,7 @@ mod config;
 mod output;
 mod proto;
 mod providers;
+mod throughput;
 mod timing;
 mod warmup;
 
@@ -60,6 +61,12 @@ enum Mode {
     Race,
     /// Measure absolute latency per endpoint (server -> client)
     Latency,
+    /// Measure gRPC throughput (messages/s, bytes/s) per endpoint
+    Throughput {
+        /// Duration in seconds for throughput measurement
+        #[arg(long, default_value_t = 60)]
+        duration: u64,
+    },
     /// Full benchmark: race + absolute latency + distribution buckets
     Full,
 }
@@ -68,6 +75,7 @@ enum Mode {
 enum OutputFormat {
     Console,
     Json,
+    Csv,
 }
 
 #[tokio::main]
@@ -112,16 +120,40 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Handle throughput mode separately (different pipeline)
+    if let Mode::Throughput { duration } = &cli.mode {
+        println!("\n  chainbench-grpc v{}", env!("CARGO_PKG_VERSION"));
+        println!("  Mode: throughput");
+        println!("  Duration: {}s", duration);
+        println!("  Account: {}", bench_config.account);
+        println!("  Endpoints: {}", endpoints.len());
+        for ep in &endpoints {
+            println!("    - {} ({}) @ {}", ep.name, ep.kind.as_str(), ep.url);
+        }
+        println!();
+
+        let result = throughput::run_throughput(endpoints, bench_config, *duration).await;
+
+        match cli.output {
+            OutputFormat::Console => throughput::display_throughput_console(&result),
+            OutputFormat::Json => println!("{}", throughput::output_throughput_json(&result)),
+            OutputFormat::Csv => println!("{}", output::throughput_to_csv(&result)),
+        }
+        return;
+    }
+
     let (show_race, show_latency) = match &cli.mode {
         Mode::Race => (true, false),
         Mode::Latency => (false, true),
         Mode::Full => (true, true),
+        Mode::Throughput { .. } => unreachable!(),
     };
 
     let mode_name = match &cli.mode {
         Mode::Race => "race",
         Mode::Latency => "latency",
         Mode::Full => "full",
+        Mode::Throughput { .. } => unreachable!(),
     };
 
     println!("\n  chainbench-grpc v{}", env!("CARGO_PKG_VERSION"));
@@ -188,21 +220,44 @@ async fn main() {
         }
     });
 
-    // Wait for all providers
+    // Wait for all providers and count errors
+    let mut total_errors = 0usize;
     for handle in handles {
-        let _ = handle.await;
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!("Provider error: {}", e);
+                total_errors += 1;
+            }
+            Err(e) => {
+                error!("Provider task panicked: {}", e);
+                total_errors += 1;
+            }
+        }
     }
 
+    let test_duration = start_instant.elapsed();
+    let warmup_duration = bench_config.warmup_secs as f64;
+    let collection_duration = test_duration.as_secs_f64() - warmup_duration;
+
     // Compute and display results
-    let summary = analysis::compute_run_summary(&comparator, &endpoint_names);
+    let metadata = analysis::RunMetadata {
+        duration_secs: collection_duration.max(0.0),
+        warmup_skipped: 0, // TODO: aggregate from providers
+        total_errors,
+    };
+
+    let summary = analysis::compute_run_summary(&comparator, &endpoint_names, metadata);
 
     match cli.output {
         OutputFormat::Console => {
             output::display_console(&summary, show_race, show_latency);
         }
         OutputFormat::Json => {
-            let json = output::output_json(&summary);
-            println!("{}", json);
+            println!("{}", output::output_json(&summary));
+        }
+        OutputFormat::Csv => {
+            println!("{}", output::output_csv(&summary));
         }
     }
 }
