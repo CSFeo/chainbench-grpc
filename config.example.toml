@@ -1,0 +1,21 @@
+[config]
+transactions = 1000
+account = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+commitment = "processed"
+warmup_secs = 5
+
+# Add your endpoints below. At least one is required.
+# With 2+ endpoints, win rate comparison is enabled.
+# With 1 endpoint, only absolute latency is measured.
+
+[[endpoint]]
+name = "provider-a"
+url = "https://your-grpc-endpoint-a.com"
+x_token = "your-token-here"
+kind = "yellowstone"
+
+[[endpoint]]
+name = "provider-b"
+url = "https://your-grpc-endpoint-b.com"
+x_token = "your-token-here"
+kind = "yellowstone"
