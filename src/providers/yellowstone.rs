@@ -119,8 +119,23 @@ async fn process_yellowstone_endpoint(
     let mut accumulator = TransactionAccumulator::new();
     let mut transaction_count = 0usize;
     let mut warmup_skipped = 0usize;
+    let mut last_log_count = 0usize;
+    let mut last_log_time = std::time::Instant::now();
 
     loop {
+        // Periodic per-endpoint activity log (every 10 seconds)
+        if last_log_time.elapsed() >= std::time::Duration::from_secs(10) {
+            let new_txs = transaction_count - last_log_count;
+            info!(
+                endpoint = %endpoint_name,
+                total = transaction_count,
+                last_10s = new_txs,
+                "{:.0} tx/s",
+                new_txs as f64 / last_log_time.elapsed().as_secs_f64()
+            );
+            last_log_count = transaction_count;
+            last_log_time = std::time::Instant::now();
+        }
         tokio::select! { biased;
             _ = shutdown_rx.recv() => {
                 info!(endpoint = %endpoint_name, "Received stop signal");
