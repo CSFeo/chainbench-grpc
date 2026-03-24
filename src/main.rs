@@ -33,35 +33,57 @@ const DEFAULT_CONFIG_PATH: &str = "config.toml";
 #[derive(Parser)]
 #[command(
     name = "chainbench-grpc",
-    about = "Comprehensive Solana gRPC benchmarking tool",
-    version
+    about = "Solana gRPC benchmarking tool",
+    version,
+    after_help = "EXAMPLES:\n  \
+      chainbench-grpc latency --url https://grpc.example.com --token abc123\n  \
+      chainbench-grpc race --url https://ep1.com --token t1 --url https://ep2.com --token t2\n  \
+      chainbench-grpc full --config endpoints.toml --transactions 5000\n  \
+      chainbench-grpc throughput --url https://grpc.example.com --duration 60\n  \
+      chainbench-grpc slots --url https://grpc.example.com --target-slots 100"
 )]
 struct Cli {
     #[command(subcommand)]
     mode: Mode,
 
-    /// Path to TOML configuration file
-    #[arg(long, default_value = DEFAULT_CONFIG_PATH, global = true)]
-    config: String,
+    /// gRPC endpoint URL (can be repeated for multi-endpoint comparison)
+    #[arg(short = 'u', long = "url", global = true)]
+    urls: Vec<String>,
+
+    /// x-token for authentication (pairs with --url in order)
+    #[arg(short = 't', long = "token", global = true)]
+    tokens: Vec<String>,
+
+    /// Endpoint name (pairs with --url in order; auto-generated if omitted)
+    #[arg(short = 'n', long = "name", global = true)]
+    names: Vec<String>,
+
+    /// Solana account to monitor (default: pAMMBay/pump.fun)
+    #[arg(long, global = true, default_value = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")]
+    account: String,
+
+    /// Number of transactions to collect
+    #[arg(long, global = true, default_value_t = 1000)]
+    transactions: i32,
 
     /// Warmup duration in seconds (data discarded during warmup)
-    #[arg(long, global = true)]
-    warmup: Option<u64>,
+    #[arg(long, global = true, default_value_t = 10)]
+    warmup: u64,
 
-    /// Override transaction count from config
-    #[arg(long, global = true)]
-    transactions: Option<i32>,
-
-    /// Maximum test duration in seconds (safety timeout, default 300s)
-    #[arg(long, default_value_t = 300, global = true)]
+    /// Maximum test duration in seconds (safety timeout)
+    #[arg(long, global = true, default_value_t = 300)]
     max_duration: u64,
 
-    /// Number of runs to execute and average (default 1)
-    #[arg(long, default_value_t = 1, global = true)]
-    runs: usize,
+    /// Commitment level: processed, confirmed, finalized
+    #[arg(long, global = true, default_value = "processed")]
+    commitment: String,
+
+    /// Path to TOML config file (alternative to --url flags)
+    #[arg(long, global = true)]
+    config: Option<String>,
 
     /// Output format
-    #[arg(long, value_enum, default_value_t = OutputFormat::Console, global = true)]
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Console, global = true)]
     output: OutputFormat,
 }
 
@@ -109,31 +131,72 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    let config_toml = match ConfigToml::load_or_create(&cli.config) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Config error: {}", e);
-            eprintln!("Failed to load config: {}", e);
-            if !std::path::Path::new(&cli.config).exists() {
-                eprintln!("A default config.toml has been created. Edit it and re-run.");
+    // Build config: either from --url flags or from config file
+    let (bench_config, endpoints) = if !cli.urls.is_empty() {
+        // CLI mode: build endpoints from --url/--token/--name flags
+        let endpoints: Vec<config::Endpoint> = cli
+            .urls
+            .iter()
+            .enumerate()
+            .map(|(i, url)| {
+                let token = cli.tokens.get(i).cloned();
+                let name = cli
+                    .names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("endpoint-{}", i + 1));
+                config::Endpoint {
+                    name,
+                    url: url.clone(),
+                    x_token: token,
+                    kind: config::EndpointKind::Yellowstone,
+                }
+            })
+            .collect();
+
+        let commitment = match cli.commitment.as_str() {
+            "confirmed" => config::ArgsCommitment::Confirmed,
+            "finalized" => config::ArgsCommitment::Finalized,
+            _ => config::ArgsCommitment::Processed,
+        };
+
+        let bench = config::BenchConfig {
+            transactions: cli.transactions,
+            account: cli.account.clone(),
+            commitment,
+            warmup_secs: cli.warmup,
+            duration_secs: None,
+        };
+        (bench, endpoints)
+    } else if let Some(config_path) = &cli.config {
+        // Config file mode
+        match ConfigToml::load(config_path) {
+            Ok(c) => (c.config, c.endpoint),
+            Err(e) => {
+                eprintln!("Failed to load config {}: {}", config_path, e);
+                std::process::exit(1);
             }
-            std::process::exit(1);
         }
+    } else if std::path::Path::new(DEFAULT_CONFIG_PATH).exists() {
+        // Auto-detect config.toml in current directory
+        match ConfigToml::load(DEFAULT_CONFIG_PATH) {
+            Ok(c) => (c.config, c.endpoint),
+            Err(e) => {
+                eprintln!("Failed to load {}: {}", DEFAULT_CONFIG_PATH, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("No endpoints specified. Use --url or --config.\n");
+        eprintln!("Examples:");
+        eprintln!("  chainbench-grpc latency --url https://grpc.example.com --token YOUR_TOKEN");
+        eprintln!("  chainbench-grpc race --url https://ep1.com --token t1 --url https://ep2.com --token t2");
+        eprintln!("  chainbench-grpc full --config endpoints.toml");
+        std::process::exit(1);
     };
 
-    let mut bench_config = config_toml.config;
-    let endpoints = config_toml.endpoint;
-
-    // CLI overrides
-    if let Some(warmup) = cli.warmup {
-        bench_config.warmup_secs = warmup;
-    }
-    if let Some(txs) = cli.transactions {
-        bench_config.transactions = txs;
-    }
-
     if endpoints.is_empty() {
-        eprintln!("No endpoints configured. Add at least one [[endpoint]] to config.toml.");
+        eprintln!("No endpoints configured.");
         std::process::exit(1);
     }
 
@@ -221,7 +284,7 @@ async fn main() {
     println!("  Commitment: {}", bench_config.commitment.as_str());
     println!("  Transactions: {}", bench_config.transactions);
     println!("  Warmup: {}s", bench_config.warmup_secs);
-    println!("  Max duration: {}s", cli.max_duration);
+    println!("  Timeout: {}s", cli.max_duration);
     println!("  Endpoints: {}", endpoints.len());
     for ep in &endpoints {
         println!("    - {} ({}) @ {}", ep.name, ep.kind.as_str(), ep.url);
