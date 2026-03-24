@@ -32,10 +32,18 @@ impl GeyserProvider for YellowstoneProvider {
     }
 }
 
-fn fatal_connection_error(endpoint: &str, err: impl std::fmt::Display) -> ! {
-    error!(endpoint = endpoint, error = %err, "Failed to connect to endpoint");
-    eprintln!("Failed to connect to endpoint {}: {}", endpoint, err);
-    std::process::exit(1);
+async fn connect_client(
+    endpoint_url: &str,
+    endpoint_token: &Option<String>,
+) -> Result<GeyserGrpcClient, Box<dyn Error + Send + Sync>> {
+    let builder = GeyserGrpcClient::build_from_shared(endpoint_url.to_string())?;
+    let builder = if let Some(token) = endpoint_token {
+        builder.x_token(Some(token.clone()))?
+    } else {
+        builder
+    };
+    let builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
+    Ok(builder.connect().await?)
 }
 
 async fn process_yellowstone_endpoint(
@@ -64,188 +72,202 @@ async fn process_yellowstone_endpoint(
         .x_token
         .clone()
         .filter(|token| !token.trim().is_empty());
-
-    info!(endpoint = %endpoint_name, url = %endpoint_url, "Connecting");
-
-    let builder = GeyserGrpcClient::build_from_shared(endpoint_url.clone())
-        .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
-    let builder = if let Some(token) = endpoint_token {
-        builder
-            .x_token(Some(token))
-            .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err))
-    } else {
-        builder
-    };
-    let builder = builder
-        .tls_config(ClientTlsConfig::new().with_native_roots())
-        .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
-    let mut client = builder
-        .connect()
-        .await
-        .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
-
-    info!(endpoint = %endpoint_name, "Connected");
-
-    let (mut subscribe_tx, mut stream) = client.subscribe().await?;
     let commitment: CommitmentLevel = config.commitment.into();
-
-    let mut transactions = HashMap::new();
-    transactions.insert(
-        "account".to_string(),
-        SubscribeRequestFilterTransactions {
-            account_include: vec![config.account.clone()],
-            account_exclude: vec![],
-            account_required: vec![],
-            ..Default::default()
-        },
-    );
-
-    subscribe_tx
-        .send(SubscribeRequest {
-            slots: HashMap::default(),
-            accounts: HashMap::default(),
-            transactions,
-            transactions_status: HashMap::default(),
-            entry: HashMap::default(),
-            blocks: HashMap::default(),
-            blocks_meta: HashMap::default(),
-            commitment: Some(commitment as i32),
-            accounts_data_slice: Vec::default(),
-            ping: None,
-            from_slot: None,
-        })
-        .await?;
 
     let mut accumulator = TransactionAccumulator::new();
     let mut transaction_count = 0usize;
     let mut warmup_skipped = 0usize;
-    let mut last_log_count = 0usize;
-    let mut last_log_time = std::time::Instant::now();
+    let mut reconnect_count = 0u32;
+    let max_reconnects = 3;
 
-    loop {
-        // Periodic per-endpoint activity log (every 10 seconds)
-        if last_log_time.elapsed() >= std::time::Duration::from_secs(10) {
-            let new_txs = transaction_count - last_log_count;
-            info!(
-                endpoint = %endpoint_name,
-                total = transaction_count,
-                last_10s = new_txs,
-                "{:.0} tx/s",
-                new_txs as f64 / last_log_time.elapsed().as_secs_f64()
-            );
-            last_log_count = transaction_count;
-            last_log_time = std::time::Instant::now();
+    'outer: loop {
+        info!(endpoint = %endpoint_name, url = %endpoint_url, reconnects = reconnect_count, "Connecting");
+
+        let mut client = match connect_client(&endpoint_url, &endpoint_token).await {
+            Ok(c) => c,
+            Err(e) => {
+                if reconnect_count >= max_reconnects {
+                    error!(endpoint = %endpoint_name, error = %e, "Max reconnects reached, giving up");
+                    break;
+                }
+                reconnect_count += 1;
+                let delay = std::time::Duration::from_secs(2u64.pow(reconnect_count.min(4)));
+                warn!(endpoint = %endpoint_name, error = %e, delay_secs = delay.as_secs(), "Connection failed, retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
+        info!(endpoint = %endpoint_name, "Connected");
+
+        let (mut subscribe_tx, mut stream) = match client.subscribe().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(endpoint = %endpoint_name, error = %e, "Subscribe failed");
+                reconnect_count += 1;
+                continue;
+            }
+        };
+
+        // Send subscription request
+        let mut transactions_filter = HashMap::new();
+        transactions_filter.insert(
+            "account".to_string(),
+            SubscribeRequestFilterTransactions {
+                account_include: vec![config.account.clone()],
+                account_exclude: vec![],
+                account_required: vec![],
+                ..Default::default()
+            },
+        );
+
+        if let Err(e) = subscribe_tx
+            .send(SubscribeRequest {
+                slots: HashMap::default(),
+                accounts: HashMap::default(),
+                transactions: transactions_filter,
+                transactions_status: HashMap::default(),
+                entry: HashMap::default(),
+                blocks: HashMap::default(),
+                blocks_meta: HashMap::default(),
+                commitment: Some(commitment as i32),
+                accounts_data_slice: Vec::default(),
+                ping: None,
+                from_slot: None,
+            })
+            .await
+        {
+            warn!(endpoint = %endpoint_name, error = %e, "Send subscribe request failed");
+            reconnect_count += 1;
+            continue;
         }
-        tokio::select! { biased;
-            _ = shutdown_rx.recv() => {
-                info!(endpoint = %endpoint_name, "Received stop signal");
-                break;
+        let mut last_log_count = transaction_count;
+        let mut last_log_time = std::time::Instant::now();
+
+        loop {
+            // Periodic per-endpoint activity log
+            if last_log_time.elapsed() >= std::time::Duration::from_secs(10) {
+                let new_txs = transaction_count - last_log_count;
+                info!(
+                    endpoint = %endpoint_name,
+                    total = transaction_count,
+                    last_10s = new_txs,
+                    reconnects = reconnect_count,
+                    "{:.0} tx/s",
+                    new_txs as f64 / last_log_time.elapsed().as_secs_f64()
+                );
+                last_log_count = transaction_count;
+                last_log_time = std::time::Instant::now();
             }
 
-            message = stream.next() => {
-                match message {
-                    Some(Ok(msg)) => {
-                        match msg.update_oneof {
-                            Some(UpdateOneof::Transaction(tx_msg)) => {
-                                if let Some(tx) = tx_msg.transaction.as_ref()
-                                    && let Some(inner_msg) = tx.transaction.as_ref().and_then(|t| t.message.as_ref()) {
-                                        let has_account = inner_msg
-                                            .account_keys
-                                            .iter()
-                                            .any(|key| key.as_slice() == account_pubkey.as_ref());
+            tokio::select! { biased;
+                _ = shutdown_rx.recv() => {
+                    info!(endpoint = %endpoint_name, "Received stop signal");
+                    break 'outer;
+                }
 
-                                        if has_account {
-                                            // Skip observations during warmup
-                                            if warmup.is_warming_up() {
-                                                warmup_skipped += 1;
-                                                continue;
-                                            }
+                message = stream.next() => {
+                    match message {
+                        Some(Ok(msg)) => {
+                            match msg.update_oneof {
+                                Some(UpdateOneof::Transaction(tx_msg)) => {
+                                    if let Some(tx) = tx_msg.transaction.as_ref()
+                                        && let Some(inner_msg) = tx.transaction.as_ref().and_then(|t| t.message.as_ref()) {
+                                            let has_account = inner_msg
+                                                .account_keys
+                                                .iter()
+                                                .any(|key| key.as_slice() == account_pubkey.as_ref());
 
-                                            let signature = match tx.transaction.as_ref()
-                                                .and_then(|t| t.signatures.first()) {
-                                                Some(sig) => bs58::encode(sig).into_string(),
-                                                None => {
-                                                    warn!(endpoint = %endpoint_name, "Missing signature");
+                                            if has_account {
+                                                if warmup.is_warming_up() {
+                                                    warmup_skipped += 1;
                                                     continue;
                                                 }
-                                            };
 
-                                            // Build observation with server-side timestamp if available
-                                            let tx_data = timing::make_observation(
-                                                msg.created_at.as_ref(),
-                                                start_instant,
-                                                start_wallclock_ms,
-                                            );
+                                                let signature = match tx.transaction.as_ref()
+                                                    .and_then(|t| t.signatures.first()) {
+                                                    Some(sig) => bs58::encode(sig).into_string(),
+                                                    None => continue,
+                                                };
 
-                                            // Log first few observations for diagnostics
-                                            if transaction_count < 3 {
-                                                let abs_lat = tx_data.client_wallclock_ms - tx_data.timestamp_ms;
-                                                info!(
-                                                    endpoint = %endpoint_name,
-                                                    sig = %&signature[..16],
-                                                    server_ts_ms = tx_data.timestamp_ms,
-                                                    client_ts_ms = tx_data.client_wallclock_ms,
-                                                    abs_latency_ms = abs_lat,
-                                                    source = ?tx_data.timestamp_source,
-                                                    "Diagnostic: first observations"
+                                                let tx_data = timing::make_observation(
+                                                    msg.created_at.as_ref(),
+                                                    start_instant,
+                                                    start_wallclock_ms,
                                                 );
-                                            }
 
-                                            let updated = accumulator.record(
-                                                signature.clone(),
-                                                tx_data.clone(),
-                                            );
+                                                if transaction_count < 3 {
+                                                    let abs_lat = tx_data.client_wallclock_ms - tx_data.timestamp_ms;
+                                                    info!(
+                                                        endpoint = %endpoint_name,
+                                                        sig = %&signature[..16],
+                                                        abs_latency_ms = abs_lat,
+                                                        source = ?tx_data.timestamp_source,
+                                                        "Diagnostic"
+                                                    );
+                                                }
 
-                                            if updated {
-                                                if let Some(_snapshot) = comparator.record_observation(
-                                                    &endpoint_name,
-                                                    &signature,
-                                                    tx_data,
-                                                    total_producers,
-                                                ) {
-                                                    if let Some(target) = target_transactions {
-                                                        let shared = shared_counter
-                                                            .fetch_add(1, Ordering::AcqRel)
-                                                            + 1;
-                                                        if let Some(tracker) = progress.as_ref() {
-                                                            tracker.record(shared);
-                                                        }
-                                                        if shared >= target
-                                                            && !shared_shutdown.swap(true, Ordering::AcqRel)
-                                                        {
-                                                            info!(endpoint = %endpoint_name, target, "Reached target; broadcasting shutdown");
-                                                            let _ = shutdown_tx.send(());
+                                                let updated = accumulator.record(signature.clone(), tx_data.clone());
+
+                                                if updated {
+                                                    if let Some(_snapshot) = comparator.record_observation(
+                                                        &endpoint_name,
+                                                        &signature,
+                                                        tx_data,
+                                                        total_producers,
+                                                    ) {
+                                                        if let Some(target) = target_transactions {
+                                                            let shared = shared_counter.fetch_add(1, Ordering::AcqRel) + 1;
+                                                            if let Some(tracker) = progress.as_ref() {
+                                                                tracker.record(shared);
+                                                            }
+                                                            if shared >= target && !shared_shutdown.swap(true, Ordering::AcqRel) {
+                                                                info!(endpoint = %endpoint_name, target, "Reached target; broadcasting shutdown");
+                                                                let _ = shutdown_tx.send(());
+                                                            }
                                                         }
                                                     }
                                                 }
-                                            }
 
-                                            transaction_count += 1;
+                                                transaction_count += 1;
+                                            }
                                         }
-                                    }
-                            },
-                            Some(UpdateOneof::Ping(_)) => {
-                                subscribe_tx
-                                    .send(SubscribeRequest {
-                                        ping: Some(SubscribeRequestPing { id: 1 }),
-                                        ..Default::default()
-                                    })
-                                    .await?;
-                            },
-                            _ => {}
+                                },
+                                Some(UpdateOneof::Ping(_)) => {
+                                    let _ = subscribe_tx
+                                        .send(SubscribeRequest {
+                                            ping: Some(SubscribeRequestPing { id: 1 }),
+                                            ..Default::default()
+                                        })
+                                        .await;
+                                },
+                                _ => {}
+                            }
+                        },
+                        Some(Err(e)) => {
+                            warn!(endpoint = %endpoint_name, error = ?e, "Stream error");
+                            break; // break inner loop, retry outer
+                        },
+                        None => {
+                            warn!(endpoint = %endpoint_name, "Stream closed by server");
+                            break;
                         }
-                    },
-                    Some(Err(e)) => {
-                        error!(endpoint = %endpoint_name, error = ?e, "Stream error");
-                        break;
-                    },
-                    None => {
-                        info!(endpoint = %endpoint_name, "Stream closed");
-                        break;
                     }
                 }
             }
         }
+
+        // Stream broke — try reconnecting
+        if shared_shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        if reconnect_count >= max_reconnects {
+            error!(endpoint = %endpoint_name, "Max reconnects ({}) reached", max_reconnects);
+            break;
+        }
+        reconnect_count += 1;
+        let delay = std::time::Duration::from_secs(2u64.pow(reconnect_count.min(4)));
+        warn!(endpoint = %endpoint_name, reconnects = reconnect_count, delay_secs = delay.as_secs(), "Reconnecting");
+        tokio::time::sleep(delay).await;
     }
 
     let unique_signatures = accumulator.len();
@@ -256,6 +278,7 @@ async fn process_yellowstone_endpoint(
         total_transactions = transaction_count,
         unique_signatures,
         warmup_skipped,
+        reconnects = reconnect_count,
         "Provider finished"
     );
     Ok(())
