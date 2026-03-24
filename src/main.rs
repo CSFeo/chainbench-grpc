@@ -14,9 +14,11 @@ use tracing_subscriber::EnvFilter;
 mod analysis;
 mod collector;
 mod config;
+mod html;
 mod output;
 mod proto;
 mod providers;
+mod slots;
 mod throughput;
 mod timing;
 mod warmup;
@@ -71,6 +73,12 @@ enum Mode {
         #[arg(long, default_value_t = 60)]
         duration: u64,
     },
+    /// Track slot lifecycle stages (download, replay, confirm, finalize)
+    Slots {
+        /// Number of finalized slots to collect
+        #[arg(long, default_value_t = 100)]
+        target_slots: usize,
+    },
     /// Full benchmark: race + absolute latency + distribution buckets
     Full,
 }
@@ -80,6 +88,7 @@ enum OutputFormat {
     Console,
     Json,
     Csv,
+    Html,
 }
 
 #[tokio::main]
@@ -124,6 +133,39 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Handle slots mode separately
+    if let Mode::Slots { target_slots } = &cli.mode {
+        println!("\n  chainbench-grpc v{}", env!("CARGO_PKG_VERSION"));
+        println!("  Mode: slots (lifecycle)");
+        println!("  Target finalized slots: {}", target_slots);
+        println!("  Max duration: {}s", cli.max_duration);
+        println!("  Endpoints: {}", endpoints.len());
+        for ep in &endpoints {
+            println!("    - {} ({}) @ {}", ep.name, ep.kind.as_str(), ep.url);
+        }
+        println!();
+
+        let result = slots::run_slot_benchmark(
+            endpoints,
+            bench_config,
+            *target_slots,
+            cli.max_duration,
+        )
+        .await;
+
+        match cli.output {
+            OutputFormat::Console => slots::display_slot_console(&result),
+            OutputFormat::Json => {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+            }
+            OutputFormat::Csv | OutputFormat::Html => {
+                slots::display_slot_console(&result);
+                eprintln!("  (CSV/HTML not yet implemented for slots mode)");
+            }
+        }
+        return;
+    }
+
     // Handle throughput mode separately (different pipeline)
     if let Mode::Throughput { duration } = &cli.mode {
         println!("\n  chainbench-grpc v{}", env!("CARGO_PKG_VERSION"));
@@ -142,6 +184,11 @@ async fn main() {
             OutputFormat::Console => throughput::display_throughput_console(&result),
             OutputFormat::Json => println!("{}", throughput::output_throughput_json(&result)),
             OutputFormat::Csv => println!("{}", output::throughput_to_csv(&result)),
+            OutputFormat::Html => {
+                let path = "report.html";
+                std::fs::write(path, html::render_throughput(&result)).expect("Failed to write HTML");
+                eprintln!("  Report saved to {}", path);
+            }
         }
         return;
     }
@@ -150,14 +197,14 @@ async fn main() {
         Mode::Race => (true, false),
         Mode::Latency => (false, true),
         Mode::Full => (true, true),
-        Mode::Throughput { .. } => unreachable!(),
+        Mode::Throughput { .. } | Mode::Slots { .. } => unreachable!(),
     };
 
     let mode_name = match &cli.mode {
         Mode::Race => "race",
         Mode::Latency => "latency",
         Mode::Full => "full",
-        Mode::Throughput { .. } => unreachable!(),
+        Mode::Throughput { .. } | Mode::Slots { .. } => unreachable!(),
     };
 
     println!("\n  chainbench-grpc v{}", env!("CARGO_PKG_VERSION"));
@@ -280,6 +327,11 @@ async fn main() {
         }
         OutputFormat::Csv => {
             println!("{}", output::output_csv(&summary));
+        }
+        OutputFormat::Html => {
+            let path = "report.html";
+            std::fs::write(path, html::render_run_summary(&summary)).expect("Failed to write HTML");
+            eprintln!("  Report saved to {}", path);
         }
     }
 }
