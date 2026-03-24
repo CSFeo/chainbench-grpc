@@ -50,6 +50,10 @@ struct Cli {
     #[arg(long, global = true)]
     transactions: Option<i32>,
 
+    /// Maximum test duration in seconds (safety timeout, default 300s)
+    #[arg(long, default_value_t = 300, global = true)]
+    max_duration: u64,
+
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Console, global = true)]
     output: OutputFormat,
@@ -162,6 +166,7 @@ async fn main() {
     println!("  Commitment: {}", bench_config.commitment.as_str());
     println!("  Transactions: {}", bench_config.transactions);
     println!("  Warmup: {}s", bench_config.warmup_secs);
+    println!("  Max duration: {}s", cli.max_duration);
     println!("  Endpoints: {}", endpoints.len());
     for ep in &endpoints {
         println!("    - {} ({}) @ {}", ep.name, ep.kind.as_str(), ep.url);
@@ -217,6 +222,23 @@ async fn main() {
             info!("Ctrl+C received, shutting down...");
             ctrl_shared_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = ctrl_shutdown_tx.send(());
+        }
+    });
+
+    // Safety timeout
+    let timeout_shutdown_tx = shutdown_tx.clone();
+    let timeout_shared_shutdown = Arc::clone(&shared_shutdown);
+    let max_duration = cli.max_duration;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(max_duration)).await;
+        if !timeout_shared_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("Max duration {}s reached, forcing shutdown", max_duration);
+            eprintln!(
+                "\n  Warning: max duration {}s reached. Use --max-duration to increase.",
+                max_duration
+            );
+            timeout_shared_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = timeout_shutdown_tx.send(());
         }
     });
 
