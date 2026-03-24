@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Comprehensive Solana gRPC benchmarking tool"
 license = "Apache-2.0"
+repository = "https://github.com/CSFeo/chainbench-grpc"
+authors = ["CSFeo"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
