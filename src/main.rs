@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long, default_value_t = 300, global = true)]
     max_duration: u64,
 
+    /// Number of runs to execute and average (default 1)
+    #[arg(long, default_value_t = 1, global = true)]
+    runs: usize,
+
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Console, global = true)]
     output: OutputFormat,
@@ -158,9 +162,13 @@ async fn main() {
             OutputFormat::Json => {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
             }
-            OutputFormat::Csv | OutputFormat::Html => {
+            OutputFormat::Csv => {
                 slots::display_slot_console(&result);
-                eprintln!("  (CSV/HTML not yet implemented for slots mode)");
+            }
+            OutputFormat::Html => {
+                let path = "report.html";
+                std::fs::write(path, html::render_slots(&result)).expect("Failed to write HTML");
+                eprintln!("  Report saved to {}", path);
             }
         }
         return;
