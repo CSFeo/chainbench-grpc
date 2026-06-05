@@ -29,15 +29,19 @@ pub fn render_run_summary(summary: &RunSummary) -> String {
   <td class="num">{}</td>
   <td class="num">{}</td>
   <td class="num">{}</td>
+  <td class="num">{}</td>
+  <td class="num">{}</td>
 </tr>"#,
                 ep.name,
                 badge,
                 ep.score,
                 ep.first_share * 100.0,
                 fmt(ep.rel_p50_ms),
+                fmt(ep.rel_p90_ms),
                 fmt(ep.rel_p95_ms),
                 fmt(ep.rel_p99_ms),
                 fmt(ep.abs_p50_ms),
+                fmt(ep.abs_p90_ms),
                 fmt(ep.abs_p95_ms),
                 fmt(ep.abs_p99_ms),
             )
@@ -62,13 +66,20 @@ pub fn render_run_summary(summary: &RunSummary) -> String {
   <td class="num">{} <small>({:.0}%)</small></td>
 </tr>"#,
                 ep.name,
-                b.less_than_400, b.less_than_400 as f64 / total * 100.0,
-                b.from_400_to_799, b.from_400_to_799 as f64 / total * 100.0,
-                b.from_800_to_999, b.from_800_to_999 as f64 / total * 100.0,
-                b.from_1000_to_1199, b.from_1000_to_1199 as f64 / total * 100.0,
-                b.from_1200_to_1499, b.from_1200_to_1499 as f64 / total * 100.0,
-                b.from_1500_to_1999, b.from_1500_to_1999 as f64 / total * 100.0,
-                b.at_2000_or_more, b.at_2000_or_more as f64 / total * 100.0,
+                b.less_than_400,
+                b.less_than_400 as f64 / total * 100.0,
+                b.from_400_to_799,
+                b.from_400_to_799 as f64 / total * 100.0,
+                b.from_800_to_999,
+                b.from_800_to_999 as f64 / total * 100.0,
+                b.from_1000_to_1199,
+                b.from_1000_to_1199 as f64 / total * 100.0,
+                b.from_1200_to_1499,
+                b.from_1200_to_1499 as f64 / total * 100.0,
+                b.from_1500_to_1999,
+                b.from_1500_to_1999 as f64 / total * 100.0,
+                b.at_2000_or_more,
+                b.at_2000_or_more as f64 / total * 100.0,
             )
         })
         .collect::<Vec<_>>()
@@ -81,6 +92,8 @@ pub fn render_run_summary(summary: &RunSummary) -> String {
                 r#"<tr>
   <td>{}</td>
   <td class="num">{:.1}%</td>
+  <td class="num">{:.1}%</td>
+  <td class="num">{}</td>
   <td class="num">{}</td>
   <td class="num">{}</td>
   <td class="num">{}</td>
@@ -88,6 +101,8 @@ pub fn render_run_summary(summary: &RunSummary) -> String {
 </tr>"#,
                 ep.name,
                 ep.timestamp_coverage_pct,
+                ep.success_rate_pct,
+                ep.reconnect_count,
                 ep.server_timestamp_count,
                 ep.client_timestamp_count,
                 ep.valid_transactions,
@@ -158,8 +173,8 @@ pub fn render_run_summary(summary: &RunSummary) -> String {
 <table>
 <tr>
   <th>Endpoint</th><th>Score</th><th>Win %</th>
-  <th>Rel P50</th><th>Rel P95</th><th>Rel P99</th>
-  <th>Abs P50</th><th>Abs P95</th><th>Abs P99</th>
+  <th>Rel P50</th><th>Rel P90</th><th>Rel P95</th><th>Rel P99</th>
+  <th>Abs P50</th><th>Abs P90</th><th>Abs P95</th><th>Abs P99</th>
 </tr>
 {race_rows}
 </table>
@@ -176,7 +191,7 @@ pub fn render_run_summary(summary: &RunSummary) -> String {
 <h2>Reliability</h2>
 <table>
 <tr>
-  <th>Endpoint</th><th>TS Coverage</th><th>Server TS</th><th>Client TS</th>
+  <th>Endpoint</th><th>TS Coverage</th><th>Success %</th><th>Reconnects</th><th>Server TS</th><th>Client TS</th>
   <th>Valid Tx</th><th>Backfill</th>
 </tr>
 {reliability_rows}
@@ -263,11 +278,17 @@ pub fn render_slots(result: &crate::slots::SlotBenchResult) -> String {
   <td class="num">{}</td><td class="num">{}</td>
   <td class="num">{}</td><td class="num">{}</td>
 </tr>"#,
-                ep.endpoint, ep.slots_collected, ep.slots_complete,
-                fms(ep.download.p50_ms), fms(ep.download.p90_ms),
-                fms(ep.replay.p50_ms), fms(ep.replay.p90_ms),
-                fms(ep.confirm.p50_ms), fms(ep.confirm.p90_ms),
-                fms(ep.finalize.p50_ms), fms(ep.finalize.p90_ms),
+                ep.endpoint,
+                ep.slots_collected,
+                ep.slots_complete,
+                fms(ep.download.p50_ms),
+                fms(ep.download.p90_ms),
+                fms(ep.replay.p50_ms),
+                fms(ep.replay.p90_ms),
+                fms(ep.confirm.p50_ms),
+                fms(ep.confirm.p90_ms),
+                fms(ep.finalize.p50_ms),
+                fms(ep.finalize.p90_ms),
             )
         })
         .collect::<Vec<_>>()
@@ -333,12 +354,12 @@ pub fn render_slots(result: &crate::slots::SlotBenchResult) -> String {
 }
 
 fn fms(v: Option<f64>) -> String {
-    v.map(|x| format!("{:.0}ms", x)).unwrap_or_else(|| "-".into())
+    v.map(|x| format!("{:.0}ms", x))
+        .unwrap_or_else(|| "-".into())
 }
 
 fn fmt(v: Option<f64>) -> String {
-    v.map(|x| format!("{:.2}", x))
-        .unwrap_or_else(|| "-".into())
+    v.map(|x| format!("{:.2}", x)).unwrap_or_else(|| "-".into())
 }
 
 fn humanize(bytes: usize) -> String {

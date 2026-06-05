@@ -15,6 +15,12 @@ pub struct Comparator {
     emitted: DashSet<String>,
 }
 
+impl Default for Comparator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Comparator {
     pub fn new() -> Self {
         Self {
@@ -117,6 +123,10 @@ impl TransactionAccumulator {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn into_inner(self) -> HashMap<String, TransactionData> {
         self.entries
     }
@@ -161,5 +171,71 @@ impl ProgressTracker {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timing::{TimestampSource, TransactionData};
+    use std::time::Duration;
+
+    fn tx(elapsed_ms: u64) -> TransactionData {
+        TransactionData {
+            timestamp_ms: 1_000_000.0,
+            timestamp_source: TimestampSource::ServerCreatedAt,
+            client_wallclock_ms: 1_000_000.0 + elapsed_ms as f64,
+            elapsed_since_start: Duration::from_millis(elapsed_ms),
+            start_wallclock_ms: 1_000_000.0,
+        }
+    }
+
+    #[test]
+    fn record_observation_emits_once_when_all_producers_report() {
+        let c = Comparator::new();
+        // First of two producers -> not complete yet.
+        assert!(c.record_observation("a", "sig", tx(10), 2).is_none());
+        // Second producer completes the set -> emits a snapshot once.
+        let snap = c.record_observation("b", "sig", tx(20), 2);
+        assert!(snap.is_some());
+        assert_eq!(snap.unwrap().len(), 2);
+        // Any further observation for the same sig does not re-emit.
+        assert!(c.record_observation("a", "sig", tx(5), 2).is_none());
+    }
+
+    #[test]
+    fn record_observation_single_producer_emits_immediately() {
+        let c = Comparator::new();
+        let snap = c.record_observation("solo", "sig", tx(10), 1);
+        assert!(snap.is_some());
+        assert_eq!(snap.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_observation_keeps_earliest_for_same_endpoint() {
+        let c = Comparator::new();
+        assert!(c.record_observation("a", "sig", tx(50), 1).is_some());
+        // A slower duplicate from the same endpoint is not an update -> None.
+        assert!(c.record_observation("a", "sig", tx(80), 1).is_none());
+        // Faster duplicate is an update, but already emitted -> still None,
+        // yet the stored value is the earliest.
+        assert!(c.record_observation("a", "sig", tx(20), 1).is_none());
+    }
+
+    #[test]
+    fn record_observation_zero_producers_is_noop() {
+        let c = Comparator::new();
+        assert!(c.record_observation("a", "sig", tx(10), 0).is_none());
+    }
+
+    #[test]
+    fn accumulator_earliest_wins() {
+        let mut acc = TransactionAccumulator::new();
+        assert!(acc.is_empty());
+        assert!(acc.record("sig".into(), tx(50))); // new -> true
+        assert!(!acc.record("sig".into(), tx(80))); // slower -> false (no update)
+        assert!(acc.record("sig".into(), tx(20))); // faster -> true (replaced)
+        assert_eq!(acc.len(), 1);
+        assert!(!acc.is_empty());
     }
 }

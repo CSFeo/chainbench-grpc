@@ -47,12 +47,19 @@ impl LatencyBuckets {
 struct EndpointStats {
     total_observations: usize,
     first_detections: usize,
+    /// Count of non-backfill signatures this endpoint delivered, regardless of
+    /// whether all peers also delivered them. Basis for delivery success rate.
+    observed_signatures: usize,
     delays_ms: Vec<f64>,
     absolute_latencies_ms: Vec<f64>,
     buckets: LatencyBuckets,
     backfill_transactions: usize,
     server_timestamp_count: usize,
     client_timestamp_count: usize,
+    /// Server-stamped samples with negative absolute latency (client clock
+    /// behind server clock). Excluded from the distribution, reported for
+    /// transparency — a high count signals NTP skew on the benchmark host.
+    skewed_latency_count: usize,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -61,21 +68,29 @@ pub struct EndpointSummary {
     // Relative metrics (win rate)
     pub first_share: f64,
     pub rel_p50_ms: Option<f64>,
+    pub rel_p90_ms: Option<f64>,
     pub rel_p95_ms: Option<f64>,
     pub rel_p99_ms: Option<f64>,
     // Absolute latency metrics
     pub abs_p50_ms: Option<f64>,
+    pub abs_p90_ms: Option<f64>,
     pub abs_p95_ms: Option<f64>,
     pub abs_p99_ms: Option<f64>,
     pub buckets: LatencyBuckets,
     // Reliability
     pub server_timestamp_count: usize,
     pub client_timestamp_count: usize,
+    pub skewed_latency_count: usize,
     pub timestamp_coverage_pct: f64,
+    pub reconnect_count: u32,
+    /// Fraction of non-backfill signatures (seen by any endpoint) that this
+    /// endpoint delivered, as a percentage. 100% means it missed nothing.
+    pub success_rate_pct: f64,
     // Counts
     pub valid_transactions: usize,
     pub first_detections: usize,
     pub backfill_transactions: usize,
+    pub tx_per_sec: f64,
     // Composite score (0-100)
     pub score: f64,
 }
@@ -94,10 +109,18 @@ pub struct RunSummary {
     pub total_errors: usize,
 }
 
+/// Per-endpoint runtime stats reported back by each provider task.
+#[derive(Debug, Clone, Default)]
+pub struct EndpointRuntime {
+    pub reconnect_count: u32,
+    pub warmup_skipped: usize,
+}
+
 pub struct RunMetadata {
     pub duration_secs: f64,
-    pub warmup_skipped: usize,
     pub total_errors: usize,
+    /// Keyed by endpoint name.
+    pub endpoint_runtime: HashMap<String, EndpointRuntime>,
 }
 
 pub fn compute_run_summary(
@@ -109,6 +132,9 @@ pub fn compute_run_summary(
     let expected_producers = endpoint_names.len();
     let mut total_signatures = 0usize;
     let mut backfill_signatures = 0usize;
+    // Union of non-backfill signatures seen by *any* endpoint — the denominator
+    // for per-endpoint delivery success rate.
+    let mut union_signatures = 0usize;
 
     for name in endpoint_names {
         endpoint_stats.insert(name.clone(), EndpointStats::default());
@@ -117,19 +143,18 @@ pub fn compute_run_summary(
     for sig_entry in comparator.iter() {
         let sig_data = sig_entry.value();
 
-        // For multi-endpoint: skip partial observations
-        if expected_producers > 1 && sig_data.len() != expected_producers {
+        if sig_data.is_empty() {
             continue;
         }
 
-        // For single-endpoint: accept all observations
-        if expected_producers == 1 && sig_data.is_empty() {
-            continue;
-        }
-
-        let is_historical = sig_data
-            .values()
-            .any(|tx| tx.client_wallclock_ms < tx.start_wallclock_ms);
+        // Backfill = a transaction the server created *before* this benchmark
+        // started but delivered to us on subscribe. The only reliable signal is
+        // the server `created_at` timestamp predating our start wallclock; the
+        // client receive time is always after start, so it can never detect this.
+        let is_historical = sig_data.values().any(|tx| {
+            tx.timestamp_source == TimestampSource::ServerCreatedAt
+                && tx.timestamp_ms < tx.start_wallclock_ms
+        });
 
         if is_historical {
             backfill_signatures += 1;
@@ -138,6 +163,23 @@ pub fn compute_run_summary(
                     stats.backfill_transactions += 1;
                 }
             }
+            continue;
+        }
+
+        // Delivery tracking — counted for every non-backfill signature regardless
+        // of how many endpoints reported it, so success_rate captures misses.
+        union_signatures += 1;
+        for endpoint in sig_data.keys() {
+            if let Some(stats) = endpoint_stats.get_mut(endpoint) {
+                stats.observed_signatures += 1;
+            }
+        }
+
+        // LIMITATION: win-rate and relative-latency require *all* N producers to
+        // have reported this signature. A signature missed by any endpoint is
+        // excluded from these comparison metrics (but still counted in the
+        // delivery tracking above and reflected in success_rate).
+        if expected_producers > 1 && sig_data.len() != expected_producers {
             continue;
         }
 
@@ -173,6 +215,10 @@ pub fn compute_run_summary(
                     if abs_latency >= 0.0 {
                         stats.absolute_latencies_ms.push(abs_latency);
                         stats.buckets.record(abs_latency);
+                    } else {
+                        // Negative latency is physically meaningless (clock skew);
+                        // count it rather than silently discarding the sample.
+                        stats.skewed_latency_count += 1;
                     }
                 } else {
                     stats.client_timestamp_count += 1;
@@ -185,7 +231,21 @@ pub fn compute_run_summary(
 
     let mut endpoints: Vec<EndpointSummary> = endpoint_stats
         .into_iter()
-        .map(|(name, stats)| build_summary(name, stats, total_signatures))
+        .map(|(name, stats)| {
+            let runtime = metadata
+                .endpoint_runtime
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
+            build_summary(
+                name,
+                stats,
+                total_signatures,
+                union_signatures,
+                metadata.duration_secs,
+                runtime,
+            )
+        })
         .collect();
 
     // Compute composite scores
@@ -205,6 +265,12 @@ pub fn compute_run_summary(
         0.0
     };
 
+    let warmup_skipped = metadata
+        .endpoint_runtime
+        .values()
+        .map(|r| r.warmup_skipped)
+        .sum();
+
     RunSummary {
         endpoints,
         fastest_endpoint,
@@ -213,15 +279,34 @@ pub fn compute_run_summary(
         backfill_signatures,
         test_duration_secs: metadata.duration_secs,
         throughput_tx_per_sec: throughput,
-        warmup_skipped: metadata.warmup_skipped,
+        warmup_skipped,
         total_errors: metadata.total_errors,
     }
 }
 
-fn build_summary(name: String, stats: EndpointStats, total_signatures: usize) -> EndpointSummary {
+fn build_summary(
+    name: String,
+    stats: EndpointStats,
+    total_signatures: usize,
+    union_signatures: usize,
+    duration_secs: f64,
+    runtime: EndpointRuntime,
+) -> EndpointSummary {
     let total_ts = stats.server_timestamp_count + stats.client_timestamp_count;
     let coverage = if total_ts > 0 {
         stats.server_timestamp_count as f64 / total_ts as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let success_rate_pct = if union_signatures > 0 {
+        stats.observed_signatures as f64 / union_signatures as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let tx_per_sec = if duration_secs > 0.0 {
+        stats.observed_signatures as f64 / duration_secs
     } else {
         0.0
     };
@@ -233,7 +318,11 @@ fn build_summary(name: String, stats: EndpointStats, total_signatures: usize) ->
         backfill_transactions: stats.backfill_transactions,
         server_timestamp_count: stats.server_timestamp_count,
         client_timestamp_count: stats.client_timestamp_count,
+        skewed_latency_count: stats.skewed_latency_count,
         timestamp_coverage_pct: coverage,
+        reconnect_count: runtime.reconnect_count,
+        success_rate_pct,
+        tx_per_sec,
         buckets: stats.buckets,
         ..Default::default()
     };
@@ -246,6 +335,7 @@ fn build_summary(name: String, stats: EndpointStats, total_signatures: usize) ->
         let mut sorted = stats.delays_ms;
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
         summary.rel_p50_ms = Some(percentile(&sorted, 0.50));
+        summary.rel_p90_ms = Some(percentile(&sorted, 0.90));
         summary.rel_p95_ms = Some(percentile(&sorted, 0.95));
         summary.rel_p99_ms = Some(percentile(&sorted, 0.99));
     }
@@ -254,6 +344,7 @@ fn build_summary(name: String, stats: EndpointStats, total_signatures: usize) ->
         let mut sorted = stats.absolute_latencies_ms;
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
         summary.abs_p50_ms = Some(percentile(&sorted, 0.50));
+        summary.abs_p90_ms = Some(percentile(&sorted, 0.90));
         summary.abs_p95_ms = Some(percentile(&sorted, 0.95));
         summary.abs_p99_ms = Some(percentile(&sorted, 0.99));
     }
@@ -271,19 +362,19 @@ pub fn percentile(sorted_data: &[f64], p: f64) -> f64 {
 
 /// Composite score (0-100) combining win rate, latency, and reliability.
 ///
+/// Uses **fixed absolute thresholds**, not normalization relative to the best
+/// peer in the run — so a given endpoint's score is stable regardless of which
+/// competitors it is compared against (a relative-to-best score would shift as
+/// the competitor set changes). The throughput component is the one exception:
+/// it is relative to the busiest endpoint, measuring "did this endpoint keep up".
+///
 /// Formula:
-///   win_rate_component  = first_share * 30          (30% weight)
-///   latency_component   = latency_score * 25        (25% weight, lower P50 = better)
-///   reliability_component = coverage_pct / 100 * 25 (25% weight)
-///   stability_component = stability * 10            (10% weight, low P99-P50 jitter)
-///   throughput_component = min(observations / expected, 1.0) * 10 (10% weight)
+///   win_rate_component    = first_share * 30                      (30% weight)
+///   latency_component     = clamp((1000 - p50)/950) * 25          (25% weight, lower P50 = better)
+///   reliability_component = coverage_pct / 100 * 25               (25% weight)
+///   stability_component   = clamp((1000 - (p99-p50))/950) * 10    (10% weight, low jitter)
+///   throughput_component  = min(observations / max_observations, 1.0) * 10 (10% weight)
 fn compute_scores(endpoints: &mut [EndpointSummary], num_endpoints: usize) {
-    // Find the best absolute P50 across all endpoints for normalization
-    let best_abs_p50 = endpoints
-        .iter()
-        .filter_map(|e| e.abs_p50_ms)
-        .fold(f64::MAX, f64::min);
-
     let max_observations = endpoints
         .iter()
         .map(|e| e.valid_transactions)
@@ -336,5 +427,211 @@ fn compare_latency(lhs: &EndpointSummary, rhs: &EndpointSummary) -> Ordering {
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => lhs.name.cmp(&rhs.name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timing::{TimestampSource, TransactionData};
+    use std::collections::HashMap;
+
+    // --- percentile (nearest-rank with round) ---
+
+    #[test]
+    fn percentile_empty_is_zero() {
+        assert_eq!(percentile(&[], 0.5), 0.0);
+    }
+
+    #[test]
+    fn percentile_single_element() {
+        assert_eq!(percentile(&[42.0], 0.5), 42.0);
+        assert_eq!(percentile(&[42.0], 0.99), 42.0);
+    }
+
+    #[test]
+    fn percentile_known_distribution() {
+        // 1..=10, indices 0..=9. p50 -> round(0.5*9)=round(4.5)=5 -> 6.0
+        let data: Vec<f64> = (1..=10).map(|n| n as f64).collect();
+        assert_eq!(percentile(&data, 0.50), 6.0);
+        assert_eq!(percentile(&data, 0.95), 10.0); // round(8.55)=9 -> 10
+        assert_eq!(percentile(&data, 0.99), 10.0);
+        assert_eq!(percentile(&data, 0.0), 1.0);
+    }
+
+    // --- latency buckets boundaries ---
+
+    #[test]
+    fn buckets_boundaries() {
+        let mut b = LatencyBuckets::default();
+        for v in [
+            0.0, 399.9, 400.0, 799.0, 800.0, 999.0, 1000.0, 1500.0, 2000.0, 5000.0,
+        ] {
+            b.record(v);
+        }
+        assert_eq!(b.less_than_400, 2); // 0, 399.9
+        assert_eq!(b.from_400_to_799, 2); // 400, 799
+        assert_eq!(b.from_800_to_999, 2); // 800, 999
+        assert_eq!(b.from_1000_to_1199, 1); // 1000
+        assert_eq!(b.from_1500_to_1999, 1); // 1500
+        assert_eq!(b.at_2000_or_more, 2); // 2000, 5000
+        assert_eq!(b.total(), 10);
+    }
+
+    // --- compute_run_summary: backfill + skew + happy path ---
+
+    fn server_tx(
+        timestamp_ms: f64,
+        client_ms: f64,
+        start_ms: f64,
+        elapsed_ms: u64,
+    ) -> TransactionData {
+        TransactionData {
+            timestamp_ms,
+            timestamp_source: TimestampSource::ServerCreatedAt,
+            client_wallclock_ms: client_ms,
+            elapsed_since_start: Duration::from_millis(elapsed_ms),
+            start_wallclock_ms: start_ms,
+        }
+    }
+
+    fn single_endpoint_summary(sigs: Vec<(&str, TransactionData)>) -> RunSummary {
+        let comparator = Comparator::new();
+        let mut batch = HashMap::new();
+        for (sig, data) in sigs {
+            batch.insert(sig.to_string(), data);
+        }
+        comparator.add_batch("ep1", batch);
+        compute_run_summary(
+            &comparator,
+            &["ep1".to_string()],
+            RunMetadata {
+                duration_secs: 1.0,
+                total_errors: 0,
+                endpoint_runtime: HashMap::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn backfill_detected_via_server_timestamp() {
+        let start = 1_000_000.0;
+        // created 5s before start, received after start -> historical
+        let summary = single_endpoint_summary(vec![(
+            "sigA",
+            server_tx(start - 5000.0, start + 50.0, start, 50),
+        )]);
+        assert_eq!(summary.backfill_signatures, 1);
+        assert_eq!(summary.total_signatures, 0);
+        assert_eq!(summary.endpoints[0].backfill_transactions, 1);
+    }
+
+    #[test]
+    fn realtime_not_flagged_as_backfill() {
+        let start = 1_000_000.0;
+        // created after start -> real-time, 46ms latency
+        let summary = single_endpoint_summary(vec![(
+            "sigA",
+            server_tx(start + 100.0, start + 146.0, start, 146),
+        )]);
+        assert_eq!(summary.backfill_signatures, 0);
+        assert_eq!(summary.total_signatures, 1);
+        assert_eq!(summary.endpoints[0].abs_p50_ms, Some(46.0));
+        assert_eq!(summary.endpoints[0].abs_p90_ms, Some(46.0));
+        assert_eq!(summary.endpoints[0].skewed_latency_count, 0);
+        // single endpoint delivered the only signature -> 100% success
+        assert_eq!(summary.endpoints[0].success_rate_pct, 100.0);
+        assert_eq!(summary.endpoints[0].tx_per_sec, 1.0); // 1 sig / 1.0s
+    }
+
+    #[test]
+    fn success_rate_reflects_missed_signatures() {
+        // Two endpoints; sigA seen by both, sigB only by fast. Multi-endpoint
+        // win-rate excludes sigB (partial), but success_rate must still show the
+        // slow endpoint missed it.
+        let start = 1_000_000.0;
+        let comparator = Comparator::new();
+        let mut fast = HashMap::new();
+        fast.insert(
+            "sigA".to_string(),
+            server_tx(start + 100.0, start + 140.0, start, 100),
+        );
+        fast.insert(
+            "sigB".to_string(),
+            server_tx(start + 200.0, start + 240.0, start, 200),
+        );
+        comparator.add_batch("fast", fast);
+        let mut slow = HashMap::new();
+        slow.insert(
+            "sigA".to_string(),
+            server_tx(start + 100.0, start + 150.0, start, 110),
+        );
+        comparator.add_batch("slow", slow);
+
+        let summary = compute_run_summary(
+            &comparator,
+            &["fast".to_string(), "slow".to_string()],
+            RunMetadata {
+                duration_secs: 1.0,
+                total_errors: 0,
+                endpoint_runtime: HashMap::new(),
+            },
+        );
+
+        // union = 2 (sigA, sigB); only sigA is complete -> total_signatures = 1
+        assert_eq!(summary.total_signatures, 1);
+        let fast = summary.endpoints.iter().find(|e| e.name == "fast").unwrap();
+        let slow = summary.endpoints.iter().find(|e| e.name == "slow").unwrap();
+        assert_eq!(fast.success_rate_pct, 100.0); // saw both
+        assert_eq!(slow.success_rate_pct, 50.0); // missed sigB
+    }
+
+    #[test]
+    fn negative_latency_counted_not_dropped() {
+        let start = 1_000_000.0;
+        // server clock ahead of client -> negative abs latency, but real-time
+        let summary = single_endpoint_summary(vec![(
+            "sigA",
+            server_tx(start + 200.0, start + 100.0, start, 100),
+        )]);
+        assert_eq!(summary.total_signatures, 1);
+        assert_eq!(summary.endpoints[0].skewed_latency_count, 1);
+        assert_eq!(summary.endpoints[0].abs_p50_ms, None); // excluded from distribution
+        assert_eq!(summary.endpoints[0].buckets.total(), 0);
+    }
+
+    // --- compute_scores ---
+
+    #[test]
+    fn single_endpoint_gets_full_win_component() {
+        let mut eps = vec![EndpointSummary {
+            name: "solo".into(),
+            abs_p50_ms: Some(50.0),
+            abs_p99_ms: Some(50.0),
+            timestamp_coverage_pct: 100.0,
+            valid_transactions: 100,
+            ..Default::default()
+        }];
+        compute_scores(&mut eps, 1);
+        // win 30 + latency ~25 + reliability 25 + stability ~10 + throughput 10 ~= 100
+        assert!(eps[0].score > 99.0, "score was {}", eps[0].score);
+    }
+
+    #[test]
+    fn score_rewards_lower_latency() {
+        let base = |p50: f64| EndpointSummary {
+            name: "e".into(),
+            first_share: 0.5,
+            abs_p50_ms: Some(p50),
+            abs_p99_ms: Some(p50),
+            timestamp_coverage_pct: 100.0,
+            valid_transactions: 100,
+            ..Default::default()
+        };
+        let mut fast = vec![base(50.0)];
+        let mut slow = vec![base(900.0)];
+        compute_scores(&mut fast, 2);
+        compute_scores(&mut slow, 2);
+        assert!(fast[0].score > slow[0].score);
     }
 }

@@ -11,7 +11,7 @@ use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::Serialize;
 use tokio::sync::broadcast;
 use tonic::transport::ClientTlsConfig;
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     config::{BenchConfig, Endpoint},
@@ -25,12 +25,12 @@ use crate::{
 /// Slot status stages we track (from Thorofare)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum SlotStage {
-    FirstShredReceived,  // status 3
-    Completed,           // status 4
-    CreatedBank,         // status 5
-    Processed,           // status 0
-    Confirmed,           // status 1
-    Finalized,           // status 2
+    FirstShredReceived, // status 3
+    Completed,          // status 4
+    CreatedBank,        // status 5
+    Processed,          // status 0
+    Confirmed,          // status 1
+    Finalized,          // status 2
 }
 
 impl SlotStage {
@@ -45,32 +45,10 @@ impl SlotStage {
             _ => None,
         }
     }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SlotStage::FirstShredReceived => "FirstShred",
-            SlotStage::Completed => "Completed",
-            SlotStage::CreatedBank => "CreatedBank",
-            SlotStage::Processed => "Processed",
-            SlotStage::Confirmed => "Confirmed",
-            SlotStage::Finalized => "Finalized",
-        }
-    }
 }
 
-#[derive(Debug, Clone)]
-struct SlotObservation {
-    stage: SlotStage,
-    instant: Instant,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SlotStageTiming {
-    pub download_ms: Option<f64>,    // FirstShred -> Completed
-    pub replay_ms: Option<f64>,      // CreatedBank -> Processed
-    pub confirm_ms: Option<f64>,     // Processed -> Confirmed
-    pub finalize_ms: Option<f64>,    // Confirmed -> Finalized
-}
+/// Per-slot map of which lifecycle stage was observed and when.
+type SlotData = HashMap<u64, HashMap<SlotStage, Instant>>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SlotEndpointSummary {
@@ -142,7 +120,7 @@ pub async fn run_slot_benchmark(
     }
 
     // Collect per-endpoint data
-    let mut all_data: Vec<(String, HashMap<u64, HashMap<SlotStage, Instant>>)> = Vec::new();
+    let mut all_data: Vec<(String, SlotData)> = Vec::new();
 
     for handle in handles {
         match handle.await {
@@ -168,7 +146,9 @@ pub async fn run_slot_benchmark(
             .collect();
         sets.iter()
             .skip(1)
-            .fold(sets[0].clone(), |acc, s| acc.intersection(s).copied().collect())
+            .fold(sets[0].clone(), |acc, s| {
+                acc.intersection(s).copied().collect()
+            })
             .len()
     } else {
         all_data.first().map(|(_, d)| d.len()).unwrap_or(0)
@@ -188,101 +168,167 @@ async fn collect_slots(
     running: Arc<AtomicBool>,
     counter: Arc<AtomicUsize>,
     target_slots: usize,
-) -> Result<(String, HashMap<u64, HashMap<SlotStage, Instant>>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(String, SlotData), Box<dyn std::error::Error + Send + Sync>> {
     let name = endpoint.name.clone();
     let url = endpoint.url.clone();
     let token = endpoint.x_token.clone().filter(|t| !t.trim().is_empty());
+    let commitment: CommitmentLevel = config.commitment.into();
 
-    info!(endpoint = %name, "Slots: connecting");
-
-    let builder = GeyserGrpcClient::build_from_shared(url)?;
-    let builder = if let Some(t) = token { builder.x_token(Some(t))? } else { builder };
-    let builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
-    let mut client = builder.connect().await?;
-
-    let (mut subscribe_tx, mut stream) = client.subscribe().await?;
-
-    // Subscribe to slot updates only
-    let mut slots_filter = HashMap::new();
-    slots_filter.insert(
-        "slots".to_string(),
-        SubscribeRequestFilterSlots {
-            filter_by_commitment: None,
-            interslot_updates: Some(true),
-        },
-    );
-
-    subscribe_tx
-        .send(SubscribeRequest {
-            slots: slots_filter,
-            accounts: HashMap::default(),
-            transactions: HashMap::default(),
-            transactions_status: HashMap::default(),
-            entry: HashMap::default(),
-            blocks: HashMap::default(),
-            blocks_meta: HashMap::default(),
-            commitment: None,
-            accounts_data_slice: Vec::default(),
-            ping: None,
-            from_slot: None,
-        })
-        .await?;
-
-    info!(endpoint = %name, "Slots: subscribed");
-
-    let mut slot_data: HashMap<u64, HashMap<SlotStage, Instant>> = HashMap::new();
+    let mut slot_data: SlotData = HashMap::new();
     let mut finalized_count = 0usize;
+    let mut reconnect_count = 0u32;
+    let max_reconnects = 3u32;
 
-    loop {
-        tokio::select! { biased;
-            _ = shutdown_rx.recv() => break,
-            message = stream.next() => {
-                match message {
-                    Some(Ok(msg)) => {
-                        match msg.update_oneof {
-                            Some(UpdateOneof::Slot(slot_msg)) => {
-                                if let Some(stage) = SlotStage::from_i32(slot_msg.status) {
-                                    let slot = slot_msg.slot;
-                                    let now = Instant::now();
-                                    slot_data.entry(slot).or_default().insert(stage, now);
+    // Reconnect outer loop: a dropped stream mid-run resumes into the same
+    // slot_data so partial collection isn't lost (matches the tx provider).
+    'outer: loop {
+        info!(endpoint = %name, reconnects = reconnect_count, "Slots: connecting");
 
-                                    if stage == SlotStage::Finalized {
-                                        finalized_count += 1;
-                                        let total = counter.fetch_add(1, Ordering::AcqRel) + 1;
-                                        if total % 50 == 0 || total <= 5 {
-                                            info!(endpoint = %name, finalized = finalized_count, total_slots = slot_data.len());
-                                        }
-                                        if finalized_count >= target_slots {
-                                            break;
+        // `client` must outlive the stream (the returned stream borrows it), so
+        // it is bound here in the outer-loop scope rather than inside a helper.
+        let connect_result = async {
+            let mut builder = GeyserGrpcClient::build_from_shared(url.clone())?;
+            if let Some(t) = token.clone() {
+                builder = builder.x_token(Some(t))?;
+            }
+            if url.starts_with("https://") {
+                builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
+            }
+            let client = builder.connect().await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(client)
+        }
+        .await;
+
+        let mut client = match connect_result {
+            Ok(c) => c,
+            Err(e) => {
+                if reconnect_count >= max_reconnects {
+                    error!(endpoint = %name, error = %e, "Slots: max reconnects reached, giving up");
+                    break;
+                }
+                reconnect_count += 1;
+                let delay = Duration::from_secs(2u64.pow(reconnect_count.min(4)));
+                warn!(endpoint = %name, error = %e, delay_secs = delay.as_secs(), "Slots: connect failed, retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
+
+        let (mut subscribe_tx, mut stream) = match client.subscribe().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                if reconnect_count >= max_reconnects {
+                    error!(endpoint = %name, error = %e, "Slots: subscribe failed, max reconnects reached");
+                    break;
+                }
+                reconnect_count += 1;
+                let delay = Duration::from_secs(2u64.pow(reconnect_count.min(4)));
+                warn!(endpoint = %name, error = %e, delay_secs = delay.as_secs(), "Slots: subscribe failed, retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
+
+        let mut slots_filter = HashMap::new();
+        slots_filter.insert(
+            "slots".to_string(),
+            SubscribeRequestFilterSlots {
+                filter_by_commitment: None,
+                interslot_updates: Some(true),
+            },
+        );
+        if let Err(e) = subscribe_tx
+            .send(SubscribeRequest {
+                slots: slots_filter,
+                accounts: HashMap::default(),
+                transactions: HashMap::default(),
+                transactions_status: HashMap::default(),
+                entry: HashMap::default(),
+                blocks: HashMap::default(),
+                blocks_meta: HashMap::default(),
+                commitment: Some(commitment as i32),
+                accounts_data_slice: Vec::default(),
+                ping: None,
+                from_slot: None,
+            })
+            .await
+        {
+            if reconnect_count >= max_reconnects {
+                error!(endpoint = %name, error = %e, "Slots: send subscribe failed, max reconnects reached");
+                break;
+            }
+            reconnect_count += 1;
+            let delay = Duration::from_secs(2u64.pow(reconnect_count.min(4)));
+            warn!(endpoint = %name, error = %e, delay_secs = delay.as_secs(), "Slots: send subscribe failed, retrying");
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+
+        info!(endpoint = %name, "Slots: subscribed");
+
+        loop {
+            tokio::select! { biased;
+                _ = shutdown_rx.recv() => break 'outer,
+                message = stream.next() => {
+                    match message {
+                        Some(Ok(msg)) => {
+                            match msg.update_oneof {
+                                Some(UpdateOneof::Slot(slot_msg)) => {
+                                    if let Some(stage) = SlotStage::from_i32(slot_msg.status) {
+                                        let slot = slot_msg.slot;
+                                        let now = Instant::now();
+                                        slot_data.entry(slot).or_default().insert(stage, now);
+
+                                        if stage == SlotStage::Finalized {
+                                            finalized_count += 1;
+                                            let total = counter.fetch_add(1, Ordering::AcqRel) + 1;
+                                            if total.is_multiple_of(50) || total <= 5 {
+                                                info!(endpoint = %name, finalized = finalized_count, total_slots = slot_data.len());
+                                            }
+                                            if finalized_count >= target_slots {
+                                                break 'outer;
+                                            }
                                         }
                                     }
                                 }
+                                Some(UpdateOneof::Ping(_)) => {
+                                    let _ = subscribe_tx.send(SubscribeRequest {
+                                        ping: Some(SubscribeRequestPing { id: 1 }),
+                                        ..Default::default()
+                                    }).await;
+                                }
+                                _ => {}
                             }
-                            Some(UpdateOneof::Ping(_)) => {
-                                let _ = subscribe_tx.send(SubscribeRequest {
-                                    ping: Some(SubscribeRequestPing { id: 1 }),
-                                    ..Default::default()
-                                }).await;
-                            }
-                            _ => {}
                         }
+                        Some(Err(e)) => { warn!(endpoint = %name, error = ?e, "Slot stream error"); break; }
+                        None => { warn!(endpoint = %name, "Slot stream closed by server"); break; }
                     }
-                    Some(Err(e)) => { error!(endpoint = %name, error = ?e, "Slot stream error"); break; }
-                    None => break,
                 }
             }
+            if !running.load(Ordering::Relaxed) {
+                break 'outer;
+            }
         }
-        if !running.load(Ordering::Relaxed) { break; }
+
+        // Stream broke — reconnect unless we're shutting down or out of retries.
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        if reconnect_count >= max_reconnects {
+            error!(endpoint = %name, "Slots: max reconnects ({}) reached", max_reconnects);
+            break;
+        }
+        reconnect_count += 1;
+        let delay = Duration::from_secs(2u64.pow(reconnect_count.min(4)));
+        warn!(endpoint = %name, reconnects = reconnect_count, delay_secs = delay.as_secs(), "Slots: reconnecting");
+        tokio::time::sleep(delay).await;
     }
 
-    info!(endpoint = %name, total_slots = slot_data.len(), finalized = finalized_count, "Slots: finished");
+    info!(endpoint = %name, total_slots = slot_data.len(), finalized = finalized_count, reconnects = reconnect_count, "Slots: finished");
     Ok((name, slot_data))
 }
 
-fn compute_endpoint_slot_summary(
-    name: &str,
-    data: &HashMap<u64, HashMap<SlotStage, Instant>>,
-) -> SlotEndpointSummary {
+fn compute_endpoint_slot_summary(name: &str, data: &SlotData) -> SlotEndpointSummary {
     let mut downloads = Vec::new();
     let mut replays = Vec::new();
     let mut confirms = Vec::new();
@@ -304,7 +350,10 @@ fn compute_endpoint_slot_summary(
         }
         complete += 1;
 
-        if let (Some(a), Some(b)) = (get(SlotStage::FirstShredReceived), get(SlotStage::Completed)) {
+        if let (Some(a), Some(b)) = (
+            get(SlotStage::FirstShredReceived),
+            get(SlotStage::Completed),
+        ) {
             downloads.push(b.duration_since(*a).as_secs_f64() * 1000.0);
         }
         if let (Some(a), Some(b)) = (get(SlotStage::CreatedBank), get(SlotStage::Processed)) {
@@ -329,7 +378,7 @@ fn compute_endpoint_slot_summary(
     }
 }
 
-fn make_percentiles(data: &mut Vec<f64>) -> PercentileSummary {
+fn make_percentiles(data: &mut [f64]) -> PercentileSummary {
     if data.is_empty() {
         return PercentileSummary::default();
     }
@@ -342,7 +391,9 @@ fn make_percentiles(data: &mut Vec<f64>) -> PercentileSummary {
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() { return 0.0; }
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let idx = (p * (sorted.len() - 1) as f64).round() as usize;
     sorted[idx]
 }
@@ -352,7 +403,10 @@ pub fn display_slot_console(result: &SlotBenchResult) {
 
     println!("\n  Slot Lifecycle Results");
     println!("  ============================================");
-    println!("  Common slots: {} | Duration: {:.1}s", result.common_slots, result.duration_secs);
+    println!(
+        "  Common slots: {} | Duration: {:.1}s",
+        result.common_slots, result.duration_secs
+    );
 
     let mut table = Table::new();
     #[cfg(not(target_os = "windows"))]
@@ -361,11 +415,17 @@ pub fn display_slot_console(result: &SlotBenchResult) {
     table.load_preset(comfy_table::presets::ASCII_FULL);
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec![
-        "Endpoint", "Slots", "Complete",
-        "Download P50", "Download P90",
-        "Replay P50", "Replay P90",
-        "Confirm P50", "Confirm P90",
-        "Finalize P50", "Finalize P90",
+        "Endpoint",
+        "Slots",
+        "Complete",
+        "Download P50",
+        "Download P90",
+        "Replay P50",
+        "Replay P90",
+        "Confirm P50",
+        "Confirm P90",
+        "Finalize P50",
+        "Finalize P90",
     ]);
 
     for ep in &result.endpoints {
@@ -373,10 +433,14 @@ pub fn display_slot_console(result: &SlotBenchResult) {
             ep.endpoint.clone(),
             ep.slots_collected.to_string(),
             ep.slots_complete.to_string(),
-            f(ep.download.p50_ms), f(ep.download.p90_ms),
-            f(ep.replay.p50_ms), f(ep.replay.p90_ms),
-            f(ep.confirm.p50_ms), f(ep.confirm.p90_ms),
-            f(ep.finalize.p50_ms), f(ep.finalize.p90_ms),
+            f(ep.download.p50_ms),
+            f(ep.download.p90_ms),
+            f(ep.replay.p50_ms),
+            f(ep.replay.p90_ms),
+            f(ep.confirm.p50_ms),
+            f(ep.confirm.p90_ms),
+            f(ep.finalize.p50_ms),
+            f(ep.finalize.p90_ms),
         ]);
     }
 
@@ -384,5 +448,6 @@ pub fn display_slot_console(result: &SlotBenchResult) {
 }
 
 fn f(v: Option<f64>) -> String {
-    v.map(|x| format!("{:.0}ms", x)).unwrap_or_else(|| "-".into())
+    v.map(|x| format!("{:.0}ms", x))
+        .unwrap_or_else(|| "-".into())
 }

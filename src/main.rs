@@ -11,22 +11,12 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-mod analysis;
-mod collector;
-mod config;
-mod html;
-mod output;
-mod proto;
-mod providers;
-mod slots;
-mod throughput;
-mod timing;
-mod warmup;
+use chainbench_grpc::{analysis, config, html, output, slots, throughput, timing};
 
-use collector::{Comparator, ProgressTracker};
-use config::ConfigToml;
-use providers::{ProviderContext, create_provider};
-use warmup::WarmupGuard;
+use chainbench_grpc::collector::{Comparator, ProgressTracker};
+use chainbench_grpc::config::ConfigToml;
+use chainbench_grpc::providers::{ProviderContext, create_provider};
+use chainbench_grpc::warmup::WarmupGuard;
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
@@ -50,16 +40,29 @@ struct Cli {
     #[arg(short = 'u', long = "url", global = true)]
     urls: Vec<String>,
 
-    /// x-token for authentication (pairs with --url in order)
+    /// x-token for authentication (pairs with --url in order).
+    /// WARNING: visible in `ps aux`; prefer --token-from-env / --token-from-file.
     #[arg(short = 't', long = "token", global = true)]
     tokens: Vec<String>,
+
+    /// Read x-token from an environment variable (pairs with --url in order)
+    #[arg(long = "token-from-env", global = true)]
+    tokens_from_env: Vec<String>,
+
+    /// Read x-token from a file, trimmed (pairs with --url in order)
+    #[arg(long = "token-from-file", global = true)]
+    tokens_from_file: Vec<String>,
 
     /// Endpoint name (pairs with --url in order; auto-generated if omitted)
     #[arg(short = 'n', long = "name", global = true)]
     names: Vec<String>,
 
     /// Solana account to monitor (default: pAMMBay/pump.fun)
-    #[arg(long, global = true, default_value = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+    )]
     account: String,
 
     /// Number of transactions to collect
@@ -117,6 +120,54 @@ enum OutputFormat {
     Html,
 }
 
+/// Resolve the x-token for endpoint `i` by priority: explicit `--token`, then
+/// `--token-from-env` (read the named env var), then `--token-from-file` (read
+/// and trim the file). Exits with a clear error if a referenced source is
+/// missing, so tokens never silently fall back to empty.
+fn resolve_token(cli: &Cli, i: usize) -> Option<String> {
+    if let Some(t) = cli.tokens.get(i) {
+        return Some(t.clone());
+    }
+    if let Some(var) = cli.tokens_from_env.get(i) {
+        match std::env::var(var) {
+            Ok(v) => return Some(v),
+            Err(_) => {
+                eprintln!(
+                    "Error: --token-from-env '{}' is not set in the environment",
+                    var
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(path) = cli.tokens_from_file.get(i) {
+        match std::fs::read_to_string(path) {
+            Ok(v) => return Some(v.trim().to_string()),
+            Err(e) => {
+                eprintln!(
+                    "Error: --token-from-file '{}' could not be read: {}",
+                    path, e
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+    None
+}
+
+/// Write an HTML report to `report.html`, printing a clean error and exiting
+/// non-zero on failure instead of panicking.
+fn write_html_report(contents: String) {
+    let path = "report.html";
+    match std::fs::write(path, contents) {
+        Ok(()) => eprintln!("  Report saved to {}", path),
+        Err(e) => {
+            eprintln!("  Error: failed to write {}: {}", path, e);
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     rustls::crypto::ring::default_provider()
@@ -139,7 +190,7 @@ async fn main() {
             .iter()
             .enumerate()
             .map(|(i, url)| {
-                let token = cli.tokens.get(i).cloned();
+                let token = resolve_token(&cli, i);
                 let name = cli
                     .names
                     .get(i)
@@ -190,7 +241,9 @@ async fn main() {
         eprintln!("No endpoints specified. Use --url or --config.\n");
         eprintln!("Examples:");
         eprintln!("  chainbench-grpc latency --url https://grpc.example.com --token YOUR_TOKEN");
-        eprintln!("  chainbench-grpc race --url https://ep1.com --token t1 --url https://ep2.com --token t2");
+        eprintln!(
+            "  chainbench-grpc race --url https://ep1.com --token t1 --url https://ep2.com --token t2"
+        );
         eprintln!("  chainbench-grpc full --config endpoints.toml");
         std::process::exit(1);
     };
@@ -212,26 +265,23 @@ async fn main() {
         }
         println!();
 
-        let result = slots::run_slot_benchmark(
-            endpoints,
-            bench_config,
-            *target_slots,
-            cli.max_duration,
-        )
-        .await;
+        let result =
+            slots::run_slot_benchmark(endpoints, bench_config, *target_slots, cli.max_duration)
+                .await;
 
         match cli.output {
             OutputFormat::Console => slots::display_slot_console(&result),
             OutputFormat::Json => {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
             }
             OutputFormat::Csv => {
                 slots::display_slot_console(&result);
             }
             OutputFormat::Html => {
-                let path = "report.html";
-                std::fs::write(path, html::render_slots(&result)).expect("Failed to write HTML");
-                eprintln!("  Report saved to {}", path);
+                write_html_report(html::render_slots(&result));
             }
         }
         return;
@@ -256,9 +306,7 @@ async fn main() {
             OutputFormat::Json => println!("{}", throughput::output_throughput_json(&result)),
             OutputFormat::Csv => println!("{}", output::throughput_to_csv(&result)),
             OutputFormat::Html => {
-                let path = "report.html";
-                std::fs::write(path, html::render_throughput(&result)).expect("Failed to write HTML");
-                eprintln!("  Report saved to {}", path);
+                write_html_report(html::render_throughput(&result));
             }
         }
         return;
@@ -360,11 +408,21 @@ async fn main() {
         }
     });
 
-    // Wait for all providers and count errors
+    // Wait for all providers, collect per-endpoint runtime stats, count errors
     let mut total_errors = 0usize;
+    let mut endpoint_runtime: std::collections::HashMap<String, analysis::EndpointRuntime> =
+        std::collections::HashMap::new();
     for handle in handles {
         match handle.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(stats)) => {
+                endpoint_runtime.insert(
+                    stats.endpoint_name.clone(),
+                    analysis::EndpointRuntime {
+                        reconnect_count: stats.reconnect_count,
+                        warmup_skipped: stats.warmup_skipped,
+                    },
+                );
+            }
             Ok(Err(e)) => {
                 error!("Provider error: {}", e);
                 total_errors += 1;
@@ -383,8 +441,8 @@ async fn main() {
     // Compute and display results
     let metadata = analysis::RunMetadata {
         duration_secs: collection_duration.max(0.0),
-        warmup_skipped: 0, // TODO: aggregate from providers
         total_errors,
+        endpoint_runtime,
     };
 
     let summary = analysis::compute_run_summary(&comparator, &endpoint_names, metadata);
@@ -400,9 +458,7 @@ async fn main() {
             println!("{}", output::output_csv(&summary));
         }
         OutputFormat::Html => {
-            let path = "report.html";
-            std::fs::write(path, html::render_run_summary(&summary)).expect("Failed to write HTML");
-            eprintln!("  Report saved to {}", path);
+            write_html_report(html::render_run_summary(&summary));
         }
     }
 }

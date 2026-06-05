@@ -10,18 +10,20 @@ Built from the ground up combining best practices from [GeyserBench](https://git
 - **N-endpoint comparison**: compare any number of Yellowstone gRPC providers simultaneously
 - **Server-side timestamps**: uses gRPC `created_at` for precise latency measurement
 - **Win rate**: which provider detects transactions first (% of first detections)
-- **Absolute latency**: P50/P95/P99 from server to client
+- **Absolute & relative latency**: P50/**P90**/P95/P99 from server to client
 - **Latency distribution**: bucketed histogram (<400ms, 400-799ms, ... 2000ms+)
+- **Per-endpoint TPS & delivery success rate**: throughput and % of signatures delivered
 - **Slot lifecycle**: track 6 Solana slot stages (FirstShred, Completed, CreatedBank, Processed, Confirmed, Finalized)
 - **Throughput**: messages/s, bytes/s, KB/s per endpoint
 - **Composite score**: 0-100 combining win rate, latency, reliability, stability, throughput
-- **Reliability metrics**: server timestamp coverage %, per-endpoint breakdown
+- **Reliability metrics**: server timestamp coverage %, reconnect count, clock-skew samples
 - **Warmup phase**: configurable warmup period (data discarded)
 - **Backfill detection**: separates historical transactions from real-time
-- **Auto-reconnection**: exponential backoff with up to 3 retries
+- **Auto-reconnection**: exponential backoff with up to 3 retries (all modes)
 - **Safety timeout**: `--max-duration` prevents infinite hangs
 - **4 output formats**: console tables, JSON, CSV, HTML
 - **CLI-first UX**: pass endpoints directly via `--url`/`--token`, no config file required
+- **Secret-safe auth**: `--token-from-env` / `--token-from-file` keep tokens out of `ps aux`
 
 ## Quick Start
 
@@ -72,7 +74,13 @@ chainbench-grpc race \
   --transactions 5000 --warmup 30
 ```
 
-**Metrics**: Win rate %, relative latency P50/P95/P99, first detections count.
+**Metrics**: Win rate %, relative latency P50/P90/P95/P99, per-endpoint TPS, delivery success rate %, first detections count.
+
+> **Limitation**: win rate and relative latency are computed only over signatures
+> that *all* endpoints reported. A signature missed by any endpoint is excluded
+> from those comparison metrics — but it is still counted in each endpoint's
+> **delivery success rate %**, so misses remain visible. (For a long-running live
+> mode this all-N gate needs to be relaxed; tracked separately.)
 
 ### `latency` — Absolute Latency Measurement
 
@@ -140,7 +148,9 @@ Commands:
 
 Options:
   -u, --url <URL>               gRPC endpoint URL (repeatable)
-  -t, --token <TOKEN>           x-token authentication (pairs with --url)
+  -t, --token <TOKEN>           x-token authentication (pairs with --url; visible in ps aux)
+      --token-from-env <VAR>    Read x-token from an env var (pairs with --url)
+      --token-from-file <PATH>  Read x-token from a file, trimmed (pairs with --url)
   -n, --name <NAME>             Endpoint display name (pairs with --url)
       --account <ACCOUNT>       Solana account to monitor [default: pAMMBay...]
       --transactions <N>        Number of transactions to collect [default: 1000]
@@ -167,6 +177,19 @@ Multiple endpoints — repeat `-u` and `-t`:
 chainbench-grpc race \
   -u https://ep1.com -t token1 -n "Provider A" \
   -u https://ep2.com -t token2 -n "Provider B"
+```
+
+**Keeping tokens out of `ps aux`** — `--token` is visible to any user who can list
+processes. For shared or production hosts, read the token from the environment or
+a file instead (resolved per endpoint, in `--url` order):
+
+```bash
+# from an environment variable
+export EP1_TOKEN=abc123
+chainbench-grpc latency -u https://grpc.example.com --token-from-env EP1_TOKEN
+
+# from a file
+chainbench-grpc latency -u https://grpc.example.com --token-from-file ./ep1.token
 ```
 
 **TOML config file (for saved/complex setups):**
@@ -241,6 +264,11 @@ Each endpoint receives a score from 0 to 100:
 | Throughput | 10% | Transaction observation capacity |
 
 With a single endpoint, win rate gets full 30 points (no comparison possible).
+
+Latency, reliability, and stability use **fixed absolute thresholds** (e.g. latency
+scores 25 at ≤50ms, scaling to 0 at ≥1000ms), so an endpoint's score is stable
+regardless of which competitors it is run against. Only the throughput component is
+relative — it measures whether an endpoint kept up with the busiest one in the run.
 
 ## How It Works
 

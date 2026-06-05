@@ -17,7 +17,7 @@ use crate::{
     timing,
 };
 
-use super::{GeyserProvider, ProviderContext, yellowstone_client::GeyserGrpcClient};
+use super::{GeyserProvider, ProviderContext, ProviderStats, yellowstone_client::GeyserGrpcClient};
 
 pub struct YellowstoneProvider;
 
@@ -27,22 +27,29 @@ impl GeyserProvider for YellowstoneProvider {
         endpoint: Endpoint,
         config: BenchConfig,
         context: ProviderContext,
-    ) -> task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> {
+    ) -> task::JoinHandle<Result<ProviderStats, Box<dyn Error + Send + Sync>>> {
         task::spawn(async move { process_yellowstone_endpoint(endpoint, config, context).await })
     }
+}
+
+/// Exponential backoff capped at 2^4 = 16s.
+fn backoff_delay(reconnect_count: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(2u64.pow(reconnect_count.min(4)))
 }
 
 async fn connect_client(
     endpoint_url: &str,
     endpoint_token: &Option<String>,
 ) -> Result<GeyserGrpcClient, Box<dyn Error + Send + Sync>> {
-    let builder = GeyserGrpcClient::build_from_shared(endpoint_url.to_string())?;
-    let builder = if let Some(token) = endpoint_token {
-        builder.x_token(Some(token.clone()))?
-    } else {
-        builder
-    };
-    let builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
+    let mut builder = GeyserGrpcClient::build_from_shared(endpoint_url.to_string())?;
+    if let Some(token) = endpoint_token {
+        builder = builder.x_token(Some(token.clone()))?;
+    }
+    // Apply TLS only for https:// endpoints; http:// connects in plaintext
+    // (used for local/in-cluster endpoints and integration tests).
+    if endpoint_url.starts_with("https://") {
+        builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
+    }
     Ok(builder.connect().await?)
 }
 
@@ -50,7 +57,7 @@ async fn process_yellowstone_endpoint(
     endpoint: Endpoint,
     config: BenchConfig,
     context: ProviderContext,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<ProviderStats, Box<dyn Error + Send + Sync>> {
     let ProviderContext {
         shutdown_tx,
         mut shutdown_rx,
@@ -91,7 +98,7 @@ async fn process_yellowstone_endpoint(
                     break;
                 }
                 reconnect_count += 1;
-                let delay = std::time::Duration::from_secs(2u64.pow(reconnect_count.min(4)));
+                let delay = backoff_delay(reconnect_count);
                 warn!(endpoint = %endpoint_name, error = %e, delay_secs = delay.as_secs(), "Connection failed, retrying");
                 tokio::time::sleep(delay).await;
                 continue;
@@ -102,8 +109,14 @@ async fn process_yellowstone_endpoint(
         let (mut subscribe_tx, mut stream) = match client.subscribe().await {
             Ok(pair) => pair,
             Err(e) => {
-                warn!(endpoint = %endpoint_name, error = %e, "Subscribe failed");
+                if reconnect_count >= max_reconnects {
+                    error!(endpoint = %endpoint_name, error = %e, "Subscribe failed, max reconnects reached");
+                    break;
+                }
                 reconnect_count += 1;
+                let delay = backoff_delay(reconnect_count);
+                warn!(endpoint = %endpoint_name, error = %e, delay_secs = delay.as_secs(), "Subscribe failed, retrying");
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -136,8 +149,14 @@ async fn process_yellowstone_endpoint(
             })
             .await
         {
-            warn!(endpoint = %endpoint_name, error = %e, "Send subscribe request failed");
+            if reconnect_count >= max_reconnects {
+                error!(endpoint = %endpoint_name, error = %e, "Send subscribe request failed, max reconnects reached");
+                break;
+            }
             reconnect_count += 1;
+            let delay = backoff_delay(reconnect_count);
+            warn!(endpoint = %endpoint_name, error = %e, delay_secs = delay.as_secs(), "Send subscribe request failed, retrying");
+            tokio::time::sleep(delay).await;
             continue;
         }
         let mut last_log_count = transaction_count;
@@ -208,23 +227,24 @@ async fn process_yellowstone_endpoint(
 
                                                 let updated = accumulator.record(signature.clone(), tx_data.clone());
 
-                                                if updated {
-                                                    if let Some(_snapshot) = comparator.record_observation(
-                                                        &endpoint_name,
-                                                        &signature,
-                                                        tx_data,
-                                                        total_producers,
-                                                    ) {
-                                                        if let Some(target) = target_transactions {
-                                                            let shared = shared_counter.fetch_add(1, Ordering::AcqRel) + 1;
-                                                            if let Some(tracker) = progress.as_ref() {
-                                                                tracker.record(shared);
-                                                            }
-                                                            if shared >= target && !shared_shutdown.swap(true, Ordering::AcqRel) {
-                                                                info!(endpoint = %endpoint_name, target, "Reached target; broadcasting shutdown");
-                                                                let _ = shutdown_tx.send(());
-                                                            }
-                                                        }
+                                                if updated
+                                                    && comparator
+                                                        .record_observation(
+                                                            &endpoint_name,
+                                                            &signature,
+                                                            tx_data,
+                                                            total_producers,
+                                                        )
+                                                        .is_some()
+                                                    && let Some(target) = target_transactions
+                                                {
+                                                    let shared = shared_counter.fetch_add(1, Ordering::AcqRel) + 1;
+                                                    if let Some(tracker) = progress.as_ref() {
+                                                        tracker.record(shared);
+                                                    }
+                                                    if shared >= target && !shared_shutdown.swap(true, Ordering::AcqRel) {
+                                                        info!(endpoint = %endpoint_name, target, "Reached target; broadcasting shutdown");
+                                                        let _ = shutdown_tx.send(());
                                                     }
                                                 }
 
@@ -265,7 +285,7 @@ async fn process_yellowstone_endpoint(
             break;
         }
         reconnect_count += 1;
-        let delay = std::time::Duration::from_secs(2u64.pow(reconnect_count.min(4)));
+        let delay = backoff_delay(reconnect_count);
         warn!(endpoint = %endpoint_name, reconnects = reconnect_count, delay_secs = delay.as_secs(), "Reconnecting");
         tokio::time::sleep(delay).await;
     }
@@ -281,5 +301,9 @@ async fn process_yellowstone_endpoint(
         reconnects = reconnect_count,
         "Provider finished"
     );
-    Ok(())
+    Ok(ProviderStats {
+        endpoint_name: endpoint_name.clone(),
+        warmup_skipped,
+        reconnect_count,
+    })
 }
