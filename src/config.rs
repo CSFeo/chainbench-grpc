@@ -1,7 +1,7 @@
 use crate::proto::geyser::CommitmentLevel;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::fs;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigToml {
@@ -98,38 +98,5 @@ impl ConfigToml {
             fs::read_to_string(path).with_context(|| format!("Failed to read config {}", path))?;
         let config = toml::from_str(&content).map_err(|err| anyhow!(err))?;
         Ok(config)
-    }
-
-    pub fn create_default(path: &str) -> Result<Self> {
-        let default_config = ConfigToml {
-            config: BenchConfig {
-                transactions: 1000,
-                account: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA".to_string(),
-                commitment: ArgsCommitment::Processed,
-                warmup_secs: 5,
-                duration_secs: None,
-            },
-            endpoint: vec![Endpoint {
-                name: "endpoint-1".to_string(),
-                url: "https://your-grpc-endpoint.com".to_string(),
-                x_token: Some("your-token".to_string()),
-                kind: EndpointKind::Yellowstone,
-            }],
-        };
-
-        let toml_string = toml::to_string_pretty(&default_config)
-            .context("Failed to serialize default config")?;
-        fs::write(path, toml_string)
-            .with_context(|| format!("Failed to write default config {}", path))?;
-
-        Ok(default_config)
-    }
-
-    pub fn load_or_create(path: &str) -> Result<Self> {
-        if Path::new(path).exists() {
-            Self::load(path)
-        } else {
-            Self::create_default(path)
-        }
     }
 }

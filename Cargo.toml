@@ -1,6 +1,6 @@
 [package]
 name = "chainbench-grpc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Comprehensive Solana gRPC benchmarking tool"
 license = "Apache-2.0"
@@ -35,3 +35,9 @@ chrono = "0.4"
 [build-dependencies]
 tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["tls-native-roots"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+prost-types = "0.14"

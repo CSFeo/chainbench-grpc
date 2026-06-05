@@ -3,3 +3,8 @@ config.toml
 report.html
 *.log
 .DS_Store
+
+# Internal working notes — kept local, not committed
+AGENDA-ERWIN-CALL.md
+RESEARCH-SOLANA-GRPC-BENCH.md
+TS1-ASSESSMENT.md

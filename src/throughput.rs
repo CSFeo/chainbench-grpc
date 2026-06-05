@@ -102,20 +102,17 @@ async fn measure_endpoint(
 ) -> Result<ThroughputResult, Box<dyn std::error::Error + Send + Sync>> {
     let endpoint_name = endpoint.name.clone();
     let endpoint_url = endpoint.url.clone();
-    let endpoint_token = endpoint
-        .x_token
-        .clone()
-        .filter(|t| !t.trim().is_empty());
+    let endpoint_token = endpoint.x_token.clone().filter(|t| !t.trim().is_empty());
 
     info!(endpoint = %endpoint_name, "Throughput: connecting");
 
-    let builder = GeyserGrpcClient::build_from_shared(endpoint_url)?;
-    let builder = if let Some(token) = endpoint_token {
-        builder.x_token(Some(token))?
-    } else {
-        builder
-    };
-    let builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
+    let mut builder = GeyserGrpcClient::build_from_shared(endpoint_url.clone())?;
+    if let Some(token) = endpoint_token {
+        builder = builder.x_token(Some(token))?;
+    }
+    if endpoint_url.starts_with("https://") {
+        builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
+    }
     let mut client = builder.connect().await?;
 
     info!(endpoint = %endpoint_name, "Throughput: connected, subscribing to all");
@@ -217,8 +214,16 @@ async fn measure_endpoint(
         duration_secs,
         total_messages: msgs,
         total_bytes: bytes,
-        messages_per_sec: if duration_secs > 0.0 { msgs as f64 / duration_secs } else { 0.0 },
-        bytes_per_sec: if duration_secs > 0.0 { bytes as f64 / duration_secs } else { 0.0 },
+        messages_per_sec: if duration_secs > 0.0 {
+            msgs as f64 / duration_secs
+        } else {
+            0.0
+        },
+        bytes_per_sec: if duration_secs > 0.0 {
+            bytes as f64 / duration_secs
+        } else {
+            0.0
+        },
         transactions: tx_count,
         slots: slot_count,
         pings: ping_count,

@@ -38,7 +38,10 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
         if is_fastest {
             println!("  {}: Win rate {}%, p50 0.00ms (fastest)", ep.name, win);
         } else {
-            let p50 = ep.rel_p50_ms.map(|v| format!("{:.2}ms", v)).unwrap_or_else(|| "-".into());
+            let p50 = ep
+                .rel_p50_ms
+                .map(|v| format!("{:.2}ms", v))
+                .unwrap_or_else(|| "-".into());
             println!("  {}: Win rate {}%, p50 {}", ep.name, win, p50);
         }
     }
@@ -52,7 +55,17 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
         table.load_preset(table_preset());
         table.set_content_arrangement(ContentArrangement::Dynamic);
         table.set_header(vec![
-            "Endpoint", "Win %", "Rel P50 ms", "Rel P95 ms", "Rel P99 ms", "Valid Tx", "Firsts", "Backfill",
+            "Endpoint",
+            "Win %",
+            "Rel P50 ms",
+            "Rel P90 ms",
+            "Rel P95 ms",
+            "Rel P99 ms",
+            "TPS",
+            "Success %",
+            "Valid Tx",
+            "Firsts",
+            "Backfill",
         ]);
 
         for ep in &rows {
@@ -60,8 +73,11 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
                 ep.name.clone(),
                 format_percent(ep.first_share),
                 fmt_opt(ep.rel_p50_ms),
+                fmt_opt(ep.rel_p90_ms),
                 fmt_opt(ep.rel_p95_ms),
                 fmt_opt(ep.rel_p99_ms),
+                format!("{:.1}", ep.tx_per_sec),
+                format!("{:.1}", ep.success_rate_pct),
                 ep.valid_transactions.to_string(),
                 ep.first_detections.to_string(),
                 ep.backfill_transactions.to_string(),
@@ -82,7 +98,13 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
             table.load_preset(table_preset());
             table.set_content_arrangement(ContentArrangement::Dynamic);
             table.set_header(vec![
-                "Endpoint", "Abs P50 ms", "Abs P95 ms", "Abs P99 ms", "Source", "Samples",
+                "Endpoint",
+                "Abs P50 ms",
+                "Abs P90 ms",
+                "Abs P95 ms",
+                "Abs P99 ms",
+                "Source",
+                "Samples",
             ]);
 
             for ep in &rows {
@@ -94,6 +116,7 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
                 table.add_row(vec![
                     ep.name.clone(),
                     fmt_opt(ep.abs_p50_ms),
+                    fmt_opt(ep.abs_p90_ms),
                     fmt_opt(ep.abs_p95_ms),
                     fmt_opt(ep.abs_p99_ms),
                     source.to_string(),
@@ -114,7 +137,14 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
             table.load_preset(table_preset());
             table.set_content_arrangement(ContentArrangement::Dynamic);
             table.set_header(vec![
-                "Endpoint", "<400ms", "400-799", "800-999", "1000-1199", "1200-1499", "1500-1999", "2000+",
+                "Endpoint",
+                "<400ms",
+                "400-799",
+                "800-999",
+                "1000-1199",
+                "1200-1499",
+                "1500-1999",
+                "2000+",
             ]);
 
             for ep in &rows {
@@ -145,11 +175,22 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
         table.load_preset(table_preset());
         table.set_content_arrangement(ContentArrangement::Dynamic);
         table.set_header(vec![
-            "Endpoint", "Score", "Win %", "Abs P50", "Coverage %", "Transactions",
+            "Endpoint",
+            "Score",
+            "Win %",
+            "Abs P50",
+            "Coverage %",
+            "Success %",
+            "Reconnects",
+            "Transactions",
         ]);
 
         let mut scored: Vec<&EndpointSummary> = rows.clone();
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         for ep in &scored {
             table.add_row(vec![
@@ -158,6 +199,8 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
                 format_percent(ep.first_share),
                 fmt_opt(ep.abs_p50_ms),
                 format!("{:.1}%", ep.timestamp_coverage_pct),
+                format!("{:.1}%", ep.success_rate_pct),
+                ep.reconnect_count.to_string(),
                 ep.valid_transactions.to_string(),
             ]);
         }
@@ -187,6 +230,12 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
                 "  {} timestamp coverage: {:.1}% ({}/{} server)",
                 ep.name, ep.timestamp_coverage_pct, ep.server_timestamp_count, total
             );
+            if ep.skewed_latency_count > 0 {
+                println!(
+                    "    warning: {} sample(s) had negative latency (clock skew, excluded)",
+                    ep.skewed_latency_count
+                );
+            }
         }
     }
 }
@@ -198,15 +247,20 @@ pub fn output_json(summary: &RunSummary) -> String {
             "win_rate": ep.first_share,
             "relative_latency": {
                 "p50_ms": ep.rel_p50_ms,
+                "p90_ms": ep.rel_p90_ms,
                 "p95_ms": ep.rel_p95_ms,
                 "p99_ms": ep.rel_p99_ms,
             },
             "absolute_latency": {
                 "p50_ms": ep.abs_p50_ms,
+                "p90_ms": ep.abs_p90_ms,
                 "p95_ms": ep.abs_p95_ms,
                 "p99_ms": ep.abs_p99_ms,
                 "source": if ep.server_timestamp_count > 0 { "server_created_at" } else { "client_wallclock" },
             },
+            "tx_per_sec": ep.tx_per_sec,
+            "success_rate_pct": ep.success_rate_pct,
+            "reconnect_count": ep.reconnect_count,
             "buckets": {
                 "<400ms": ep.buckets.less_than_400,
                 "400-799ms": ep.buckets.from_400_to_799,
@@ -219,6 +273,7 @@ pub fn output_json(summary: &RunSummary) -> String {
             "reliability": {
                 "server_timestamps": ep.server_timestamp_count,
                 "client_timestamps": ep.client_timestamp_count,
+                "skewed_latency_samples": ep.skewed_latency_count,
                 "coverage_pct": ep.timestamp_coverage_pct,
             },
             "score": ep.score,
@@ -272,21 +327,26 @@ fn compare_by_p50(lhs: &EndpointSummary, rhs: &EndpointSummary) -> Ordering {
 
 pub fn output_csv(summary: &RunSummary) -> String {
     let mut lines = Vec::new();
-    lines.push("endpoint,score,win_pct,rel_p50_ms,rel_p95_ms,rel_p99_ms,abs_p50_ms,abs_p95_ms,abs_p99_ms,coverage_pct,valid_tx,first_detections,backfill".to_string());
+    lines.push("endpoint,score,win_pct,rel_p50_ms,rel_p90_ms,rel_p95_ms,rel_p99_ms,abs_p50_ms,abs_p90_ms,abs_p95_ms,abs_p99_ms,coverage_pct,tx_per_sec,success_rate_pct,reconnects,valid_tx,first_detections,backfill".to_string());
 
     for ep in &summary.endpoints {
         lines.push(format!(
-            "{},{:.1},{:.2},{},{},{},{},{},{},{:.1},{},{},{}",
+            "{},{:.1},{:.2},{},{},{},{},{},{},{},{},{:.1},{:.1},{:.1},{},{},{},{}",
             ep.name,
             ep.score,
             ep.first_share * 100.0,
             fmt_opt(ep.rel_p50_ms),
+            fmt_opt(ep.rel_p90_ms),
             fmt_opt(ep.rel_p95_ms),
             fmt_opt(ep.rel_p99_ms),
             fmt_opt(ep.abs_p50_ms),
+            fmt_opt(ep.abs_p90_ms),
             fmt_opt(ep.abs_p95_ms),
             fmt_opt(ep.abs_p99_ms),
             ep.timestamp_coverage_pct,
+            ep.tx_per_sec,
+            ep.success_rate_pct,
+            ep.reconnect_count,
             ep.valid_transactions,
             ep.first_detections,
             ep.backfill_transactions,

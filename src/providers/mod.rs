@@ -17,13 +17,21 @@ use crate::{
 pub mod yellowstone;
 pub(crate) mod yellowstone_client;
 
+/// Per-endpoint runtime stats returned by a provider task when it finishes.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderStats {
+    pub endpoint_name: String,
+    pub warmup_skipped: usize,
+    pub reconnect_count: u32,
+}
+
 pub trait GeyserProvider: Send + Sync {
     fn process(
         &self,
         endpoint: Endpoint,
         config: BenchConfig,
         context: ProviderContext,
-    ) -> tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>;
+    ) -> tokio::task::JoinHandle<Result<ProviderStats, Box<dyn Error + Send + Sync>>>;
 }
 
 pub fn create_provider(kind: &EndpointKind) -> Box<dyn GeyserProvider> {
