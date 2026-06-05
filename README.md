@@ -27,6 +27,12 @@ Built from the ground up combining best practices from [GeyserBench](https://git
 
 ## Quick Start
 
+### Prebuilt binaries
+
+Tagged releases attach binaries for linux (x64/arm64) and macOS (x64/arm64) to the
+[GitHub Releases](https://github.com/CSFeo/chainbench-grpc/releases) page. Download
+the archive for your platform, extract, and run `./chainbench-grpc`.
+
 ### Install from source
 
 ```bash
@@ -92,7 +98,7 @@ chainbench-grpc latency \
   --transactions 1000
 ```
 
-**Metrics**: Absolute P50/P95/P99, latency distribution buckets, timestamp coverage %.
+**Metrics**: Absolute P50/P90/P95/P99, latency distribution buckets, timestamp coverage %, clock-skew sample count.
 
 ### `full` — Complete Benchmark
 
@@ -192,6 +198,9 @@ chainbench-grpc latency -u https://grpc.example.com --token-from-env EP1_TOKEN
 chainbench-grpc latency -u https://grpc.example.com --token-from-file ./ep1.token
 ```
 
+> **Scheme & TLS**: `https://` endpoints connect over TLS (system trust roots);
+> `http://` endpoints connect in plaintext, for local or in-cluster endpoints.
+
 **TOML config file (for saved/complex setups):**
 
 ```bash
@@ -234,9 +243,33 @@ Machine-readable output for automation and CI pipelines.
 chainbench-grpc full -u https://ep.com -t TOKEN -o json > results.json
 ```
 
+Per-endpoint shape (abridged):
+
+```json
+{
+  "win_rate": 0.51,
+  "relative_latency": { "p50_ms": 0.0, "p90_ms": 4.2, "p95_ms": 6.8, "p99_ms": 11.3 },
+  "absolute_latency": { "p50_ms": 46.0, "p90_ms": 58.0, "p95_ms": 63.0, "p99_ms": 80.0, "source": "server_created_at" },
+  "tx_per_sec": 512.4,
+  "success_rate_pct": 100.0,
+  "reconnect_count": 0,
+  "reliability": { "server_timestamps": 1000, "client_timestamps": 0, "skewed_latency_samples": 0, "coverage_pct": 100.0 },
+  "score": 92.4,
+  "valid_transactions": 1000,
+  "first_detections": 510,
+  "backfill_transactions": 0
+}
+```
+
 ### CSV (`-o csv`)
 
-Spreadsheet-friendly output.
+Spreadsheet-friendly output. Columns:
+
+```
+endpoint,score,win_pct,rel_p50_ms,rel_p90_ms,rel_p95_ms,rel_p99_ms,
+abs_p50_ms,abs_p90_ms,abs_p95_ms,abs_p99_ms,coverage_pct,tx_per_sec,
+success_rate_pct,reconnects,valid_tx,first_detections,backfill
+```
 
 ```bash
 chainbench-grpc full -u https://ep.com -t TOKEN -o csv > results.csv
@@ -311,11 +344,59 @@ For statistically meaningful results:
 - Use `--warmup 30` for production tests (lets connections stabilize)
 - For multi-endpoint race, ensure both endpoints serve the same account data
 
+## Library usage
+
+The crate is split into a library (`chainbench_grpc`) and a thin CLI binary, so
+the benchmarking engine can be embedded without shelling out to the binary.
+
+```toml
+# Cargo.toml
+[dependencies]
+chainbench-grpc = { git = "https://github.com/CSFeo/chainbench-grpc" }
+```
+
+```rust
+use std::collections::HashMap;
+use chainbench_grpc::analysis::{compute_run_summary, RunMetadata};
+use chainbench_grpc::collector::Comparator;
+
+let comparator = Comparator::new();
+// ... drive comparator.record_observation(...) from your own collection loop ...
+let summary = compute_run_summary(
+    &comparator,
+    &["endpoint-1".to_string()],
+    RunMetadata { duration_secs: 10.0, total_errors: 0, endpoint_runtime: HashMap::new() },
+);
+println!("{}", chainbench_grpc::output::output_json(&summary));
+```
+
+Key entry points: [`analysis::compute_run_summary`], [`providers::create_provider`],
+[`slots::run_slot_benchmark`], [`throughput::run_throughput`], and the
+`output` / `html` renderers.
+
+## Development
+
+```bash
+cargo test                              # 23 tests (unit + integration)
+cargo fmt --all -- --check              # formatting
+cargo clippy --all-targets -- -D warnings   # lints (zero warnings)
+cargo build --release
+```
+
+Tests include unit coverage for the analysis/collector/timing logic plus two
+integration tests: a public-API pipeline test and a full **mock Yellowstone gRPC
+server** test (`tests/mock_server.rs`) that drives the real provider end to end.
+
+CI (`.github/workflows/ci.yml`) runs fmt + clippy + test + release build on every
+push and PR. Tagging `vX.Y.Z` triggers `release.yml`, which builds binaries for
+linux x64/arm64 and macOS x64/arm64 and attaches them to a GitHub Release.
+
 ## Architecture
 
 ```
 src/
-├── main.rs           # CLI (clap), mode dispatch, orchestration
+├── lib.rs            # Library root — re-exports the modules below
+├── main.rs           # Thin CLI (clap), mode dispatch, orchestration
 ├── config.rs         # TOML config + CLI flag parsing
 ├── timing.rs         # Server-side timestamp extraction
 ├── warmup.rs         # Warmup phase guard
@@ -324,12 +405,15 @@ src/
 ├── output.rs         # Console tables, JSON, CSV formatters
 ├── html.rs           # Standalone HTML report generator
 ├── throughput.rs     # Throughput measurement mode
-├── slots.rs          # Slot lifecycle tracking (6 stages)
+├── slots.rs          # Slot lifecycle tracking (6 stages, with reconnection)
 ├── proto.rs          # Generated protobuf modules
 └── providers/
-    ├── mod.rs                # GeyserProvider trait + factory
-    ├── yellowstone.rs        # Yellowstone provider (with reconnection)
+    ├── mod.rs                # GeyserProvider trait + factory + ProviderStats
+    ├── yellowstone.rs        # Yellowstone provider (reconnection + backoff)
     └── yellowstone_client.rs # gRPC client wrapper (TLS + x-token auth)
+tests/
+├── pipeline.rs       # End-to-end test via the public library API
+└── mock_server.rs    # Real provider driven against an in-process mock server
 ```
 
 ## License
