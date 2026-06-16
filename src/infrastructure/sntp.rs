@@ -1,15 +1,13 @@
-//! Minimal SNTP client for clock-offset calibration.
+//! SNTP client — probes NTP servers over UDP and produces a domain
+//! [`ClockOffset`]. The offset *formula* lives in [`crate::domain::clock`];
+//! this module owns the NTP wire format and socket I/O.
 //!
-//! Absolute one-way latency (`client_wallclock − server_created_at`) is only
-//! valid when the measurement host's clock is synchronized. This module probes
-//! NTP servers at startup to estimate the host's offset vs UTC so that offset
-//! can be corrected out of the absolute-latency measurement.
-//!
-//! Pure `std` (UDP) — no extra dependencies. Offset sign convention: **positive
-//! means the local clock is behind UTC** (so the correction is `local + offset`).
+//! Pure `std` (UDP) — no extra dependencies.
 
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::domain::clock::{ClockOffset, compute_offset_ms};
 
 /// Default public NTP servers probed when no manual offset is given.
 pub const DEFAULT_NTP_SERVERS: &[&str] =
@@ -18,16 +16,6 @@ pub const DEFAULT_NTP_SERVERS: &[&str] =
 /// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
 const NTP_UNIX_DELTA: f64 = 2_208_988_800.0;
 
-#[derive(Debug, Clone)]
-pub struct ClockOffset {
-    /// Estimated offset in milliseconds; positive = local clock is behind UTC.
-    pub offset_ms: f64,
-    /// Round-trip time to the NTP server, milliseconds.
-    pub rtt_ms: f64,
-    /// Server that produced this estimate.
-    pub server: String,
-}
-
 fn now_unix_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -35,22 +23,13 @@ fn now_unix_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Convert an 8-byte NTP timestamp (big-endian: 32-bit seconds + 32-bit fraction)
-/// to Unix seconds as f64.
+/// Convert an 8-byte NTP timestamp (big-endian: 32-bit seconds + 32-bit
+/// fraction) to Unix seconds as f64.
 fn ntp_to_unix(bytes: &[u8]) -> f64 {
     let secs = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64;
     let frac =
         u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as f64 / 4_294_967_296.0;
     (secs + frac) - NTP_UNIX_DELTA
-}
-
-/// NTP offset/delay from the four timestamps (all in Unix seconds):
-/// T1 = client send, T2 = server recv, T3 = server send, T4 = client recv.
-/// Returns (offset_ms, rtt_ms). Positive offset = local clock behind UTC.
-pub fn compute_offset_ms(t1: f64, t2: f64, t3: f64, t4: f64) -> (f64, f64) {
-    let offset = ((t2 - t1) + (t3 - t4)) / 2.0;
-    let rtt = (t4 - t1) - (t3 - t2);
-    (offset * 1000.0, rtt * 1000.0)
 }
 
 /// Query a single NTP server. `timeout` bounds both send and receive.
@@ -117,29 +96,6 @@ pub fn measure_clock_offset(servers: &[&str]) -> Option<ClockOffset> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn offset_zero_when_clocks_agree_and_symmetric() {
-        // Client and server agree; symmetric 20ms each way.
-        // T1=0, T2=0.020, T3=0.020, T4=0.040
-        let (offset, rtt) = compute_offset_ms(0.0, 0.020, 0.020, 0.040);
-        assert!((offset - 0.0).abs() < 1e-6, "offset={offset}");
-        assert!((rtt - 40.0).abs() < 1e-6, "rtt={rtt}");
-    }
-
-    #[test]
-    fn positive_offset_when_local_behind() {
-        // Server clock is 84ms ahead of local; symmetric 25ms path.
-        // local sends at 0 -> arrives at server's 0.025+0.084; server replies
-        // instantly at 0.109; client receives at 0.050 (local).
-        let t1 = 0.0;
-        let t2 = 0.025 + 0.084; // server receive (server clock)
-        let t3 = 0.025 + 0.084; // server transmit (server clock, no processing)
-        let t4 = 0.050; // client receive (local clock)
-        let (offset, rtt) = compute_offset_ms(t1, t2, t3, t4);
-        assert!((offset - 84.0).abs() < 1.0, "offset={offset}");
-        assert!((rtt - 50.0).abs() < 1.0, "rtt={rtt}");
-    }
 
     #[test]
     fn ntp_to_unix_known_value() {

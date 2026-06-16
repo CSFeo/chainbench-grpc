@@ -13,13 +13,11 @@ use tokio::sync::broadcast;
 use tonic::transport::ClientTlsConfig;
 use tracing::{error, info, warn};
 
-use crate::{
-    config::{BenchConfig, Endpoint},
-    proto::geyser::{
-        CommitmentLevel, SubscribeRequest, SubscribeRequestFilterSlots, SubscribeRequestPing,
-        subscribe_update::UpdateOneof,
-    },
-    providers::yellowstone_client::GeyserGrpcClient,
+use crate::domain::config::{BenchConfig, Endpoint};
+use crate::infrastructure::geyser::client::GeyserGrpcClient;
+use crate::infrastructure::proto::geyser::{
+    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterSlots, SubscribeRequestPing,
+    subscribe_update::UpdateOneof,
 };
 
 /// Slot status stages we track (from Thorofare)
@@ -396,58 +394,4 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     }
     let idx = (p * (sorted.len() - 1) as f64).round() as usize;
     sorted[idx]
-}
-
-pub fn display_slot_console(result: &SlotBenchResult) {
-    use comfy_table::{ContentArrangement, Table};
-
-    println!("\n  Slot Lifecycle Results");
-    println!("  ============================================");
-    println!(
-        "  Common slots: {} | Duration: {:.1}s",
-        result.common_slots, result.duration_secs
-    );
-
-    let mut table = Table::new();
-    #[cfg(not(target_os = "windows"))]
-    table.load_preset(comfy_table::presets::UTF8_FULL);
-    #[cfg(target_os = "windows")]
-    table.load_preset(comfy_table::presets::ASCII_FULL);
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(vec![
-        "Endpoint",
-        "Slots",
-        "Complete",
-        "Download P50",
-        "Download P90",
-        "Replay P50",
-        "Replay P90",
-        "Confirm P50",
-        "Confirm P90",
-        "Finalize P50",
-        "Finalize P90",
-    ]);
-
-    for ep in &result.endpoints {
-        table.add_row(vec![
-            ep.endpoint.clone(),
-            ep.slots_collected.to_string(),
-            ep.slots_complete.to_string(),
-            f(ep.download.p50_ms),
-            f(ep.download.p90_ms),
-            f(ep.replay.p50_ms),
-            f(ep.replay.p90_ms),
-            f(ep.confirm.p50_ms),
-            f(ep.confirm.p90_ms),
-            f(ep.finalize.p50_ms),
-            f(ep.finalize.p90_ms),
-        ]);
-    }
-
-    println!("{}", table);
-}
-
-fn f(v: Option<f64>) -> String {
-    v.map(|x| format!("{:.0}ms", x))
-        .unwrap_or_else(|| "-".into())
 }

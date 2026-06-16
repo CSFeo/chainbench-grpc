@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chainbench_grpc::analysis::{EndpointRuntime, RunMetadata, compute_run_summary};
-use chainbench_grpc::collector::Comparator;
-use chainbench_grpc::timing::{TimestampSource, TransactionData};
+use chainbench_grpc::domain::analysis::{EndpointRuntime, RunMetadata, compute_run_summary};
+use chainbench_grpc::domain::collector::Comparator;
+use chainbench_grpc::domain::timing::{TimestampSource, TransactionData};
 
 const START: f64 = 1_000_000.0;
 

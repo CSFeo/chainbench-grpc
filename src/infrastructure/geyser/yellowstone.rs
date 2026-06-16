@@ -6,18 +6,15 @@ use tokio::task;
 use tonic::transport::ClientTlsConfig;
 use tracing::{error, info, warn};
 
-use crate::proto::geyser::{
+use crate::domain::collector::TransactionAccumulator;
+use crate::domain::config::{BenchConfig, Endpoint};
+use crate::domain::timing;
+use crate::infrastructure::proto::geyser::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
     subscribe_update::UpdateOneof,
 };
 
-use crate::{
-    collector::TransactionAccumulator,
-    config::{BenchConfig, Endpoint},
-    timing,
-};
-
-use super::{GeyserProvider, ProviderContext, ProviderStats, yellowstone_client::GeyserGrpcClient};
+use super::{GeyserProvider, ProviderContext, ProviderStats, client::GeyserGrpcClient};
 
 pub struct YellowstoneProvider;
 
@@ -35,6 +32,12 @@ impl GeyserProvider for YellowstoneProvider {
 /// Exponential backoff capped at 2^4 = 16s.
 fn backoff_delay(reconnect_count: u32) -> std::time::Duration {
     std::time::Duration::from_secs(2u64.pow(reconnect_count.min(4)))
+}
+
+/// Convert a protobuf `created_at` to Unix milliseconds (nanosecond precision).
+/// This adapts the gRPC wire type to the plain `f64` the domain works in.
+fn server_timestamp_ms(created_at: Option<&prost_types::Timestamp>) -> Option<f64> {
+    created_at.map(|ts| (ts.seconds as f64) * 1000.0 + (ts.nanos as f64) / 1_000_000.0)
 }
 
 async fn connect_client(
@@ -208,8 +211,8 @@ async fn process_yellowstone_endpoint(
                                                     None => continue,
                                                 };
 
-                                                let tx_data = timing::make_observation(
-                                                    msg.created_at.as_ref(),
+                                                let tx_data = timing::observe(
+                                                    server_timestamp_ms(msg.created_at.as_ref()),
                                                     start_instant,
                                                     start_wallclock_ms,
                                                 );
@@ -306,4 +309,36 @@ async fn process_yellowstone_endpoint(
         warmup_skipped,
         reconnect_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_timestamp_ms;
+
+    #[test]
+    fn server_timestamp_none_when_absent() {
+        assert_eq!(server_timestamp_ms(None), None);
+    }
+
+    #[test]
+    fn server_timestamp_combines_seconds_and_nanos() {
+        let ts = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 500_000_000, // 0.5s -> 500ms
+        };
+        assert_eq!(
+            server_timestamp_ms(Some(&ts)).unwrap(),
+            1_700_000_000_000.0 + 500.0
+        );
+    }
+
+    #[test]
+    fn server_timestamp_sub_millisecond_precision() {
+        // 1ns -> 1e-6 ms; verifies sub-ms precision is preserved.
+        let ts = prost_types::Timestamp {
+            seconds: 0,
+            nanos: 1,
+        };
+        assert_eq!(server_timestamp_ms(Some(&ts)).unwrap(), 1e-6);
+    }
 }

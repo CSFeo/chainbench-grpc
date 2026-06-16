@@ -1,13 +1,9 @@
-use crate::proto::geyser::CommitmentLevel;
-use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
-use std::fs;
+//! Configuration value objects: what to benchmark and against which endpoints.
+//! Pure domain types — TOML file loading lives in
+//! [`crate::infrastructure::config_file`] and the gRPC commitment conversion in
+//! [`crate::infrastructure::geyser`].
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ConfigToml {
-    pub config: BenchConfig,
-    pub endpoint: Vec<Endpoint>,
-}
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BenchConfig {
@@ -18,8 +14,6 @@ pub struct BenchConfig {
     pub commitment: ArgsCommitment,
     #[serde(default = "default_warmup")]
     pub warmup_secs: u64,
-    #[serde(default)]
-    pub duration_secs: Option<u64>,
 }
 
 fn default_transactions() -> i32 {
@@ -59,16 +53,6 @@ pub enum ArgsCommitment {
     Finalized,
 }
 
-impl From<ArgsCommitment> for CommitmentLevel {
-    fn from(commitment: ArgsCommitment) -> Self {
-        match commitment {
-            ArgsCommitment::Processed => CommitmentLevel::Processed,
-            ArgsCommitment::Confirmed => CommitmentLevel::Confirmed,
-            ArgsCommitment::Finalized => CommitmentLevel::Finalized,
-        }
-    }
-}
-
 impl ArgsCommitment {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -89,14 +73,5 @@ impl EndpointKind {
             EndpointKind::Shreder => "shreder",
             EndpointKind::Jetstream => "jetstream",
         }
-    }
-}
-
-impl ConfigToml {
-    pub fn load(path: &str) -> Result<Self> {
-        let content =
-            fs::read_to_string(path).with_context(|| format!("Failed to read config {}", path))?;
-        let config = toml::from_str(&content).map_err(|err| anyhow!(err))?;
-        Ok(config)
     }
 }
