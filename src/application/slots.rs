@@ -13,6 +13,7 @@ use tokio::sync::broadcast;
 use tonic::transport::ClientTlsConfig;
 use tracing::{error, info, warn};
 
+use crate::domain::analysis::percentile;
 use crate::domain::config::{BenchConfig, Endpoint};
 use crate::infrastructure::geyser::client::GeyserGrpcClient;
 use crate::infrastructure::proto::geyser::{
@@ -386,12 +387,4 @@ fn make_percentiles(data: &mut [f64]) -> PercentileSummary {
         p90_ms: Some(percentile(data, 0.90)),
         p99_ms: Some(percentile(data, 0.99)),
     }
-}
-
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = (p * (sorted.len() - 1) as f64).round() as usize;
-    sorted[idx]
 }
