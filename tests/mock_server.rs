@@ -197,6 +197,7 @@ async fn provider_collects_from_mock_server() {
             duration_secs: 1.0,
             total_errors: 0,
             endpoint_runtime: HashMap::new(),
+            clock_offset_ms: 0.0,
         },
     );
 

@@ -107,6 +107,9 @@ pub struct RunSummary {
     pub throughput_tx_per_sec: f64,
     pub warmup_skipped: usize,
     pub total_errors: usize,
+    /// Clock-offset (ms, local-behind-UTC) added to client wallclock before
+    /// computing absolute latency. 0.0 = no correction applied.
+    pub clock_offset_ms: f64,
 }
 
 /// Per-endpoint runtime stats reported back by each provider task.
@@ -121,6 +124,9 @@ pub struct RunMetadata {
     pub total_errors: usize,
     /// Keyed by endpoint name.
     pub endpoint_runtime: HashMap<String, EndpointRuntime>,
+    /// Clock offset (ms, local-behind-UTC) to add to client wallclock before
+    /// computing absolute latency. 0.0 disables correction.
+    pub clock_offset_ms: f64,
 }
 
 pub fn compute_run_summary(
@@ -130,6 +136,7 @@ pub fn compute_run_summary(
 ) -> RunSummary {
     let mut endpoint_stats: HashMap<String, EndpointStats> = HashMap::new();
     let expected_producers = endpoint_names.len();
+    let clock_offset_ms = metadata.clock_offset_ms;
     let mut total_signatures = 0usize;
     let mut backfill_signatures = 0usize;
     // Union of non-backfill signatures seen by *any* endpoint — the denominator
@@ -211,7 +218,9 @@ pub fn compute_run_summary(
                 // Track timestamp source
                 if tx.timestamp_source == TimestampSource::ServerCreatedAt {
                     stats.server_timestamp_count += 1;
-                    let abs_latency = tx.client_wallclock_ms - tx.timestamp_ms;
+                    // Correct the client wallclock by the measured host offset
+                    // before differencing against the server `created_at`.
+                    let abs_latency = (tx.client_wallclock_ms + clock_offset_ms) - tx.timestamp_ms;
                     if abs_latency >= 0.0 {
                         stats.absolute_latencies_ms.push(abs_latency);
                         stats.buckets.record(abs_latency);
@@ -281,6 +290,7 @@ pub fn compute_run_summary(
         throughput_tx_per_sec: throughput,
         warmup_skipped,
         total_errors: metadata.total_errors,
+        clock_offset_ms: metadata.clock_offset_ms,
     }
 }
 
@@ -509,6 +519,29 @@ mod tests {
                 duration_secs: 1.0,
                 total_errors: 0,
                 endpoint_runtime: HashMap::new(),
+                clock_offset_ms: 0.0,
+            },
+        )
+    }
+
+    fn single_endpoint_summary_with_offset(
+        sigs: Vec<(&str, TransactionData)>,
+        clock_offset_ms: f64,
+    ) -> RunSummary {
+        let comparator = Comparator::new();
+        let mut batch = HashMap::new();
+        for (sig, data) in sigs {
+            batch.insert(sig.to_string(), data);
+        }
+        comparator.add_batch("ep1", batch);
+        compute_run_summary(
+            &comparator,
+            &["ep1".to_string()],
+            RunMetadata {
+                duration_secs: 1.0,
+                total_errors: 0,
+                endpoint_runtime: HashMap::new(),
+                clock_offset_ms,
             },
         )
     }
@@ -575,6 +608,7 @@ mod tests {
                 duration_secs: 1.0,
                 total_errors: 0,
                 endpoint_runtime: HashMap::new(),
+                clock_offset_ms: 0.0,
             },
         );
 
@@ -598,6 +632,27 @@ mod tests {
         assert_eq!(summary.endpoints[0].skewed_latency_count, 1);
         assert_eq!(summary.endpoints[0].abs_p50_ms, None); // excluded from distribution
         assert_eq!(summary.endpoints[0].buckets.total(), 0);
+    }
+
+    #[test]
+    fn clock_offset_correction_recovers_true_latency() {
+        // Reproduces the live finding: host clock 84ms behind, true one-way 25ms.
+        // Raw abs latency = client - server = -59ms (negative, skewed).
+        let start = 1_000_000.0;
+        let server_created = start + 100.0;
+        let client_recv = server_created + 25.0 - 84.0; // host clock 84ms behind
+        let tx = server_tx(server_created, client_recv, start, 25);
+
+        // Without correction: negative, excluded.
+        let raw = single_endpoint_summary_with_offset(vec![("sigA", tx.clone())], 0.0);
+        assert_eq!(raw.endpoints[0].skewed_latency_count, 1);
+        assert_eq!(raw.endpoints[0].abs_p50_ms, None);
+
+        // With +84ms offset correction: recovers ~25ms, no longer skewed.
+        let corrected = single_endpoint_summary_with_offset(vec![("sigA", tx)], 84.0);
+        assert_eq!(corrected.endpoints[0].skewed_latency_count, 0);
+        assert_eq!(corrected.endpoints[0].abs_p50_ms, Some(25.0));
+        assert_eq!(corrected.clock_offset_ms, 84.0);
     }
 
     // --- compute_scores ---

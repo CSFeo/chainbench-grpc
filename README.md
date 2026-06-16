@@ -163,6 +163,8 @@ Options:
       --warmup <SECS>           Warmup duration in seconds [default: 10]
       --max-duration <SECS>     Safety timeout [default: 300]
       --commitment <LEVEL>      processed|confirmed|finalized [default: processed]
+      --clock-offset-ms <MS>    Manual client clock offset (+ = local behind UTC); skips NTP probe
+      --no-clock-correction     Report raw absolute latency (disable NTP correction)
       --config <PATH>           TOML config file (alternative to --url)
   -o, --output <FORMAT>         console|json|csv|html [default: console]
   -h, --help                    Print help
@@ -326,6 +328,17 @@ relative — it measures whether an endpoint kept up with the busiest one in the
 The tool uses the `created_at` field from the Yellowstone gRPC `SubscribeUpdate` message, which is set server-side with nanosecond precision. This is more accurate than Solana block timestamps (second-level granularity only).
 
 Absolute latency = `client_wallclock - server_created_at`. This includes network propagation time and any server-side queuing.
+
+### Clock skew & absolute latency
+
+Absolute latency compares two *different* clocks (the provider's and yours), so it
+is only valid when they are synchronized. By default the tool probes NTP at startup,
+measures the host's offset vs UTC, and corrects it out (`corrected = client + offset − server_created_at`).
+Samples that remain negative after correction (residual skew) are counted and
+excluded, and the applied offset is reported. Use `--clock-offset-ms` to set the
+offset manually (offline/air-gapped) or `--no-clock-correction` for raw values.
+For publishable numbers, run from an NTP-disciplined, colocated host — relative/race
+metrics, throughput, and slot durations are unaffected by skew either way.
 
 ## Testing Guidelines
 

@@ -11,6 +11,7 @@
 //! - [`output`] / [`html`] — render a summary to console/JSON/CSV/HTML
 
 pub mod analysis;
+pub mod clock;
 pub mod collector;
 pub mod config;
 pub mod html;

@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use chainbench_grpc::{analysis, config, html, output, slots, throughput, timing};
+use chainbench_grpc::{analysis, clock, config, html, output, slots, throughput, timing};
 
 use chainbench_grpc::collector::{Comparator, ProgressTracker};
 use chainbench_grpc::config::ConfigToml;
@@ -80,6 +80,16 @@ struct Cli {
     /// Commitment level: processed, confirmed, finalized
     #[arg(long, global = true, default_value = "processed")]
     commitment: String,
+
+    /// Manually set the client clock offset in ms (positive = local clock behind
+    /// UTC). Added to client wallclock before computing absolute latency. Skips
+    /// the automatic NTP probe.
+    #[arg(long, global = true)]
+    clock_offset_ms: Option<f64>,
+
+    /// Disable clock-offset correction entirely (report raw absolute latency).
+    #[arg(long, global = true, default_value_t = false)]
+    no_clock_correction: bool,
 
     /// Path to TOML config file (alternative to --url flags)
     #[arg(long, global = true)]
@@ -153,6 +163,36 @@ fn resolve_token(cli: &Cli, i: usize) -> Option<String> {
         }
     }
     None
+}
+
+/// Resolve the clock offset (ms, local-behind-UTC) used to correct absolute
+/// latency: explicit `--no-clock-correction` wins, then `--clock-offset-ms`,
+/// otherwise an automatic NTP probe (graceful fallback to 0 if it fails).
+/// Returns (offset_ms, source).
+async fn resolve_clock_offset(cli: &Cli) -> (f64, &'static str) {
+    if cli.no_clock_correction {
+        return (0.0, "disabled");
+    }
+    if let Some(off) = cli.clock_offset_ms {
+        return (off, "manual");
+    }
+    match tokio::task::spawn_blocking(|| clock::measure_clock_offset(clock::DEFAULT_NTP_SERVERS))
+        .await
+    {
+        Ok(Some(c)) => {
+            info!(
+                offset_ms = c.offset_ms,
+                rtt_ms = c.rtt_ms,
+                server = %c.server,
+                "Measured clock offset via NTP"
+            );
+            (c.offset_ms, "ntp")
+        }
+        _ => {
+            error!("NTP clock probe failed; absolute latency will be uncorrected");
+            (0.0, "unavailable")
+        }
+    }
 }
 
 /// Write an HTML report to `report.html`, printing a clean error and exiting
@@ -337,6 +377,25 @@ async fn main() {
     for ep in &endpoints {
         println!("    - {} ({}) @ {}", ep.name, ep.kind.as_str(), ep.url);
     }
+
+    // Resolve the clock offset used to correct absolute latency.
+    let (clock_offset_ms, offset_source) = resolve_clock_offset(&cli).await;
+    match offset_source {
+        "disabled" => println!("  Clock correction: disabled (raw absolute latency)"),
+        "manual" => println!("  Clock offset: {:+.1}ms (manual)", clock_offset_ms),
+        "ntp" => {
+            println!("  Clock offset: {:+.1}ms (NTP)", clock_offset_ms);
+            if clock_offset_ms.abs() > 5.0 {
+                println!(
+                    "    note: host clock is {:+.1}ms off UTC — absolute latency corrected",
+                    clock_offset_ms
+                );
+            }
+        }
+        _ => println!(
+            "  Clock offset: unavailable (NTP probe failed) — absolute latency uncorrected"
+        ),
+    }
     println!();
 
     // Setup shared state
@@ -443,6 +502,7 @@ async fn main() {
         duration_secs: collection_duration.max(0.0),
         total_errors,
         endpoint_runtime,
+        clock_offset_ms,
     };
 
     let summary = analysis::compute_run_summary(&comparator, &endpoint_names, metadata);

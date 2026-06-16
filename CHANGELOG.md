@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-15
+
+Clock-offset correction for absolute latency (TS1 clock-skew design, Tier 1).
+
+### Added
+- **NTP clock-offset correction.** Absolute latency now corrects the client
+  wallclock by the host's measured offset vs UTC: `corrected = (client + offset) − server_created_at`.
+  By default race/latency/full probe NTP at startup (`time.cloudflare.com`,
+  `time.google.com`, `pool.ntp.org`; lowest-RTT estimate); graceful fallback to
+  uncorrected if UDP/123 is blocked. New `src/clock.rs` — pure-`std` SNTP client.
+- Flags: `--clock-offset-ms <f64>` (manual offset, skips the probe) and
+  `--no-clock-correction` (report raw absolute latency).
+- Applied offset is shown in the run header, console summary, and JSON
+  (`clock_offset_ms`).
+- 5 new tests (SNTP offset/delay math, NTP timestamp parsing, and an end-to-end
+  correction test reproducing the live clock-skew finding). Suite now 28 tests.
+
+### Why
+A live run surfaced all-negative absolute latencies: the measuring host's clock
+was ~84 ms behind UTC while one-way network latency was ~25 ms. The TS1 guard
+correctly flagged and excluded the skewed samples; this release lets the tool
+*correct* the offset and recover a usable absolute number when the host clock is
+not perfectly synced. Relative/race, throughput, and slots were never affected.
+For published competitor numbers, still run from an NTP-disciplined, colocated host.
+
 ## [0.2.0] - 2026-06-04
 
 First production-hardening pass (TS1). Builds clean, `clippy -D warnings` clean,
