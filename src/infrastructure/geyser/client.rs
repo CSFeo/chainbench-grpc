@@ -1,10 +1,6 @@
 use {
     bytes::Bytes,
-    futures::{
-        channel::mpsc,
-        sink::{Sink, SinkExt},
-        stream::Stream,
-    },
+    futures::{channel::mpsc, sink::Sink, stream::Stream},
     std::convert::TryInto,
     tonic::{
         Request, Response, Status,
@@ -15,7 +11,9 @@ use {
     },
 };
 
-use crate::proto::geyser::{SubscribeRequest, SubscribeUpdate, geyser_client::GeyserClient};
+use crate::infrastructure::proto::geyser::{
+    SubscribeRequest, SubscribeUpdate, geyser_client::GeyserClient,
+};
 
 #[derive(Clone, Debug)]
 pub struct InterceptorXToken {
@@ -35,8 +33,6 @@ impl tonic::service::Interceptor for InterceptorXToken {
 pub enum GeyserGrpcClientError {
     #[error("gRPC status: {0}")]
     TonicStatus(#[from] Status),
-    #[error("Failed to send subscribe request: {0}")]
-    SubscribeSendError(#[from] mpsc::SendError),
 }
 
 pub type GeyserGrpcClientResult<T> = Result<T, GeyserGrpcClientError>;
@@ -52,29 +48,15 @@ impl GeyserGrpcClient {
         Ok(GeyserGrpcBuilder::new(Endpoint::from_shared(endpoint)?))
     }
 
+    /// Open a subscription. The caller drives the returned sink to send the
+    /// `SubscribeRequest` (filters, commitment) and reads updates from the stream.
     pub async fn subscribe(
         &mut self,
     ) -> GeyserGrpcClientResult<(
         impl Sink<SubscribeRequest, Error = mpsc::SendError>,
         impl Stream<Item = Result<SubscribeUpdate, Status>>,
     )> {
-        self.subscribe_with_request(None).await
-    }
-
-    pub async fn subscribe_with_request(
-        &mut self,
-        request: Option<SubscribeRequest>,
-    ) -> GeyserGrpcClientResult<(
-        impl Sink<SubscribeRequest, Error = mpsc::SendError>,
-        impl Stream<Item = Result<SubscribeUpdate, Status>>,
-    )> {
-        let (mut subscribe_tx, subscribe_rx) = mpsc::unbounded();
-        if let Some(request) = request {
-            subscribe_tx
-                .send(request)
-                .await
-                .map_err(GeyserGrpcClientError::SubscribeSendError)?;
-        }
+        let (subscribe_tx, subscribe_rx) = mpsc::unbounded();
         let response: Response<Streaming<SubscribeUpdate>> =
             self.geyser.subscribe(subscribe_rx).await?;
         Ok((subscribe_tx, response.into_inner()))

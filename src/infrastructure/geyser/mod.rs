@@ -8,14 +8,25 @@ use std::{
 };
 use tokio::sync::broadcast;
 
-use crate::{
-    collector::{Comparator, ProgressTracker},
-    config::{BenchConfig, Endpoint, EndpointKind},
-    warmup::WarmupGuard,
-};
+use crate::domain::collector::{Comparator, ProgressTracker};
+use crate::domain::config::{ArgsCommitment, BenchConfig, Endpoint, EndpointKind};
+use crate::domain::warmup::WarmupGuard;
+use crate::infrastructure::proto::geyser::CommitmentLevel;
 
+pub mod client;
 pub mod yellowstone;
-pub(crate) mod yellowstone_client;
+
+/// Adapt the domain commitment value object to the gRPC enum. Lives in the
+/// infrastructure layer because `CommitmentLevel` is generated protobuf.
+impl From<ArgsCommitment> for CommitmentLevel {
+    fn from(commitment: ArgsCommitment) -> Self {
+        match commitment {
+            ArgsCommitment::Processed => CommitmentLevel::Processed,
+            ArgsCommitment::Confirmed => CommitmentLevel::Confirmed,
+            ArgsCommitment::Finalized => CommitmentLevel::Finalized,
+        }
+    }
+}
 
 /// Per-endpoint runtime stats returned by a provider task when it finishes.
 #[derive(Debug, Clone, Default)]

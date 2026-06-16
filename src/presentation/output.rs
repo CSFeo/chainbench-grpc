@@ -2,7 +2,9 @@ use comfy_table::{ContentArrangement, Table};
 use serde_json::{Map, json};
 use std::cmp::Ordering;
 
-use crate::analysis::{EndpointSummary, RunSummary};
+use crate::application::slots::SlotBenchResult;
+use crate::application::throughput::ThroughputSummary;
+use crate::domain::analysis::{EndpointSummary, RunSummary};
 
 #[cfg(target_os = "windows")]
 fn table_preset() -> &'static str {
@@ -363,7 +365,7 @@ pub fn output_csv(summary: &RunSummary) -> String {
     lines.join("\n")
 }
 
-pub fn throughput_to_csv(summary: &crate::throughput::ThroughputSummary) -> String {
+pub fn throughput_to_csv(summary: &crate::application::throughput::ThroughputSummary) -> String {
     let mut lines = Vec::new();
     lines.push("endpoint,duration_s,total_msgs,total_bytes,msgs_per_sec,kb_per_sec,transactions,slots,errors".to_string());
 
@@ -383,4 +385,101 @@ pub fn throughput_to_csv(summary: &crate::throughput::ThroughputSummary) -> Stri
     }
 
     lines.join("\n")
+}
+
+// --- slots (lifecycle) ---
+
+pub fn display_slot_console(result: &SlotBenchResult) {
+    println!("\n  Slot Lifecycle Results");
+    println!("  ============================================");
+    println!(
+        "  Common slots: {} | Duration: {:.1}s",
+        result.common_slots, result.duration_secs
+    );
+
+    let mut table = Table::new();
+    table.load_preset(table_preset());
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        "Endpoint",
+        "Slots",
+        "Complete",
+        "Download P50",
+        "Download P90",
+        "Replay P50",
+        "Replay P90",
+        "Confirm P50",
+        "Confirm P90",
+        "Finalize P50",
+        "Finalize P90",
+    ]);
+
+    for ep in &result.endpoints {
+        table.add_row(vec![
+            ep.endpoint.clone(),
+            ep.slots_collected.to_string(),
+            ep.slots_complete.to_string(),
+            fmt_ms(ep.download.p50_ms),
+            fmt_ms(ep.download.p90_ms),
+            fmt_ms(ep.replay.p50_ms),
+            fmt_ms(ep.replay.p90_ms),
+            fmt_ms(ep.confirm.p50_ms),
+            fmt_ms(ep.confirm.p90_ms),
+            fmt_ms(ep.finalize.p50_ms),
+            fmt_ms(ep.finalize.p90_ms),
+        ]);
+    }
+
+    println!("{}", table);
+}
+
+fn fmt_ms(v: Option<f64>) -> String {
+    v.map(|x| format!("{:.0}ms", x))
+        .unwrap_or_else(|| "-".into())
+}
+
+// --- throughput ---
+
+pub fn display_throughput_console(summary: &ThroughputSummary) {
+    println!("\n  Throughput Results");
+    println!("  ============================================");
+
+    let mut table = Table::new();
+    table.load_preset(table_preset());
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        "Endpoint", "Duration", "Messages", "Bytes", "Msgs/s", "KB/s", "Txs", "Slots", "Errors",
+    ]);
+
+    for r in &summary.results {
+        table.add_row(vec![
+            r.endpoint.clone(),
+            format!("{:.1}s", r.duration_secs),
+            r.total_messages.to_string(),
+            humanize_bytes(r.total_bytes),
+            format!("{:.1}", r.messages_per_sec),
+            format!("{:.1}", r.bytes_per_sec / 1024.0),
+            r.transactions.to_string(),
+            r.slots.to_string(),
+            r.errors.to_string(),
+        ]);
+    }
+
+    println!("{}", table);
+}
+
+pub fn output_throughput_json(summary: &ThroughputSummary) -> String {
+    serde_json::to_string_pretty(summary).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn humanize_bytes(bytes: usize) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }

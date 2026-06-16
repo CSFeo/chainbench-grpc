@@ -1,5 +1,5 @@
-use crate::analysis::{EndpointSummary, RunSummary};
-use crate::throughput::ThroughputSummary;
+use crate::application::throughput::ThroughputSummary;
+use crate::domain::analysis::{EndpointSummary, RunSummary};
 
 pub fn render_run_summary(summary: &RunSummary) -> String {
     let mut endpoints_sorted: Vec<&EndpointSummary> = summary.endpoints.iter().collect();
@@ -265,7 +265,7 @@ pub fn render_throughput(summary: &ThroughputSummary) -> String {
     )
 }
 
-pub fn render_slots(result: &crate::slots::SlotBenchResult) -> String {
+pub fn render_slots(result: &crate::application::slots::SlotBenchResult) -> String {
     let rows = result
         .endpoints
         .iter()

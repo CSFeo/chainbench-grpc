@@ -1,3 +1,10 @@
+//! Observation timing: the value object recorded each time an endpoint delivers
+//! a transaction, plus the wall/monotonic clock reads used to build it.
+//!
+//! The domain works in plain Unix-millisecond `f64`s. Converting a provider's
+//! protobuf `created_at` into milliseconds is an infrastructure concern (see
+//! [`crate::infrastructure::geyser`]).
+
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -21,10 +28,6 @@ pub struct TransactionData {
     pub start_wallclock_ms: f64,
 }
 
-pub fn extract_server_timestamp(created_at: Option<&prost_types::Timestamp>) -> Option<f64> {
-    created_at.map(|ts| (ts.seconds as f64) * 1000.0 + (ts.nanos as f64) / 1_000_000.0)
-}
-
 pub fn get_current_timestamp_ms() -> f64 {
     let now = SystemTime::now();
     match now.duration_since(UNIX_EPOCH) {
@@ -36,15 +39,18 @@ pub fn get_current_timestamp_ms() -> f64 {
     }
 }
 
-pub fn make_observation(
-    created_at: Option<&prost_types::Timestamp>,
+/// Build an observation. `server_ms` is the server `created_at` in Unix
+/// milliseconds when present; otherwise the client wallclock is used as the
+/// timestamp (and flagged as such).
+pub fn observe(
+    server_ms: Option<f64>,
     start_instant: Instant,
     start_wallclock_ms: f64,
 ) -> TransactionData {
     let client_wallclock_ms = get_current_timestamp_ms();
     let elapsed = start_instant.elapsed();
 
-    match extract_server_timestamp(created_at) {
+    match server_ms {
         Some(server_ms) => TransactionData {
             timestamp_ms: server_ms,
             timestamp_source: TimestampSource::ServerCreatedAt,
@@ -67,46 +73,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_server_timestamp_none_when_absent() {
-        assert_eq!(extract_server_timestamp(None), None);
-    }
-
-    #[test]
-    fn extract_server_timestamp_combines_seconds_and_nanos() {
-        let ts = prost_types::Timestamp {
-            seconds: 1_700_000_000,
-            nanos: 500_000_000, // 0.5s -> 500ms
-        };
-        let ms = extract_server_timestamp(Some(&ts)).unwrap();
-        assert_eq!(ms, 1_700_000_000_000.0 + 500.0);
-    }
-
-    #[test]
-    fn extract_server_timestamp_sub_millisecond_precision() {
-        // 1ns -> 1e-6 ms; verifies we don't lose sub-ms precision (unlike
-        // blocktime-based tools that only have second granularity).
-        let ts = prost_types::Timestamp {
-            seconds: 0,
-            nanos: 1,
-        };
-        assert_eq!(extract_server_timestamp(Some(&ts)).unwrap(), 1e-6);
-    }
-
-    #[test]
-    fn make_observation_uses_server_timestamp_when_present() {
-        let ts = prost_types::Timestamp {
-            seconds: 10,
-            nanos: 0,
-        };
-        let obs = make_observation(Some(&ts), Instant::now(), 1_000.0);
+    fn observe_uses_server_timestamp_when_present() {
+        let obs = observe(Some(10_000.0), Instant::now(), 1_000.0);
         assert_eq!(obs.timestamp_source, TimestampSource::ServerCreatedAt);
         assert_eq!(obs.timestamp_ms, 10_000.0);
         assert_eq!(obs.start_wallclock_ms, 1_000.0);
     }
 
     #[test]
-    fn make_observation_falls_back_to_client_wallclock() {
-        let obs = make_observation(None, Instant::now(), 1_000.0);
+    fn observe_falls_back_to_client_wallclock() {
+        let obs = observe(None, Instant::now(), 1_000.0);
         assert_eq!(obs.timestamp_source, TimestampSource::ClientWallclock);
         // With no server stamp, timestamp_ms mirrors the client wallclock.
         assert_eq!(obs.timestamp_ms, obs.client_wallclock_ms);

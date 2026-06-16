@@ -16,19 +16,21 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, transport::Server};
 
-use chainbench_grpc::analysis::{RunMetadata, compute_run_summary};
-use chainbench_grpc::collector::Comparator;
-use chainbench_grpc::config::{ArgsCommitment, BenchConfig, Endpoint, EndpointKind};
-use chainbench_grpc::proto::geyser::{
+use chainbench_grpc::domain::analysis::{RunMetadata, compute_run_summary};
+use chainbench_grpc::domain::collector::Comparator;
+use chainbench_grpc::domain::config::{ArgsCommitment, BenchConfig, Endpoint, EndpointKind};
+use chainbench_grpc::domain::timing;
+use chainbench_grpc::domain::warmup::WarmupGuard;
+use chainbench_grpc::infrastructure::geyser::{ProviderContext, create_provider};
+use chainbench_grpc::infrastructure::proto::geyser::{
     PingRequest, PongResponse, SubscribeUpdate, SubscribeUpdateTransaction,
     SubscribeUpdateTransactionInfo,
     geyser_server::{Geyser, GeyserServer},
     subscribe_update::UpdateOneof,
 };
-use chainbench_grpc::proto::solana::storage::confirmed_block::{Message, Transaction};
-use chainbench_grpc::providers::{ProviderContext, create_provider};
-use chainbench_grpc::timing;
-use chainbench_grpc::warmup::WarmupGuard;
+use chainbench_grpc::infrastructure::proto::solana::storage::confirmed_block::{
+    Message, Transaction,
+};
 
 /// "11111111111111111111111111111111" (System Program) decodes to 32 zero bytes,
 /// so the mock can emit that account without pulling in a base58 dependency.
@@ -83,7 +85,9 @@ impl Geyser for MockGeyser {
 
     async fn subscribe(
         &self,
-        _request: Request<tonic::Streaming<chainbench_grpc::proto::geyser::SubscribeRequest>>,
+        _request: Request<
+            tonic::Streaming<chainbench_grpc::infrastructure::proto::geyser::SubscribeRequest>,
+        >,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let updates: Vec<Result<SubscribeUpdate, Status>> =
             (0..N_UPDATES).map(|i| Ok(make_update(i))).collect();
@@ -99,38 +103,52 @@ impl Geyser for MockGeyser {
 
     async fn subscribe_replay_info(
         &self,
-        _r: Request<chainbench_grpc::proto::geyser::SubscribeReplayInfoRequest>,
-    ) -> Result<Response<chainbench_grpc::proto::geyser::SubscribeReplayInfoResponse>, Status> {
+        _r: Request<chainbench_grpc::infrastructure::proto::geyser::SubscribeReplayInfoRequest>,
+    ) -> Result<
+        Response<chainbench_grpc::infrastructure::proto::geyser::SubscribeReplayInfoResponse>,
+        Status,
+    > {
         unimplemented!()
     }
     async fn get_latest_blockhash(
         &self,
-        _r: Request<chainbench_grpc::proto::geyser::GetLatestBlockhashRequest>,
-    ) -> Result<Response<chainbench_grpc::proto::geyser::GetLatestBlockhashResponse>, Status> {
+        _r: Request<chainbench_grpc::infrastructure::proto::geyser::GetLatestBlockhashRequest>,
+    ) -> Result<
+        Response<chainbench_grpc::infrastructure::proto::geyser::GetLatestBlockhashResponse>,
+        Status,
+    > {
         unimplemented!()
     }
     async fn get_block_height(
         &self,
-        _r: Request<chainbench_grpc::proto::geyser::GetBlockHeightRequest>,
-    ) -> Result<Response<chainbench_grpc::proto::geyser::GetBlockHeightResponse>, Status> {
+        _r: Request<chainbench_grpc::infrastructure::proto::geyser::GetBlockHeightRequest>,
+    ) -> Result<
+        Response<chainbench_grpc::infrastructure::proto::geyser::GetBlockHeightResponse>,
+        Status,
+    > {
         unimplemented!()
     }
     async fn get_slot(
         &self,
-        _r: Request<chainbench_grpc::proto::geyser::GetSlotRequest>,
-    ) -> Result<Response<chainbench_grpc::proto::geyser::GetSlotResponse>, Status> {
+        _r: Request<chainbench_grpc::infrastructure::proto::geyser::GetSlotRequest>,
+    ) -> Result<Response<chainbench_grpc::infrastructure::proto::geyser::GetSlotResponse>, Status>
+    {
         unimplemented!()
     }
     async fn is_blockhash_valid(
         &self,
-        _r: Request<chainbench_grpc::proto::geyser::IsBlockhashValidRequest>,
-    ) -> Result<Response<chainbench_grpc::proto::geyser::IsBlockhashValidResponse>, Status> {
+        _r: Request<chainbench_grpc::infrastructure::proto::geyser::IsBlockhashValidRequest>,
+    ) -> Result<
+        Response<chainbench_grpc::infrastructure::proto::geyser::IsBlockhashValidResponse>,
+        Status,
+    > {
         unimplemented!()
     }
     async fn get_version(
         &self,
-        _r: Request<chainbench_grpc::proto::geyser::GetVersionRequest>,
-    ) -> Result<Response<chainbench_grpc::proto::geyser::GetVersionResponse>, Status> {
+        _r: Request<chainbench_grpc::infrastructure::proto::geyser::GetVersionRequest>,
+    ) -> Result<Response<chainbench_grpc::infrastructure::proto::geyser::GetVersionResponse>, Status>
+    {
         unimplemented!()
     }
 }
@@ -160,7 +178,6 @@ async fn provider_collects_from_mock_server() {
         account: ACCOUNT.to_string(),
         commitment: ArgsCommitment::Processed,
         warmup_secs: 0,
-        duration_secs: None,
     };
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
