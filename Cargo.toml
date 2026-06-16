@@ -1,6 +1,6 @@
 [package]
 name = "chainbench-grpc"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Comprehensive Solana gRPC benchmarking tool"
 license = "Apache-2.0"

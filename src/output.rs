@@ -221,6 +221,12 @@ pub fn display_console(summary: &RunSummary, show_race: bool, show_latency: bool
     if summary.total_errors > 0 {
         println!("  Errors:            {}", summary.total_errors);
     }
+    if summary.clock_offset_ms != 0.0 {
+        println!(
+            "  Clock offset:      {:+.1}ms (applied to absolute latency)",
+            summary.clock_offset_ms
+        );
+    }
 
     // Per-endpoint reliability
     for ep in &rows {
@@ -293,6 +299,7 @@ pub fn output_json(summary: &RunSummary) -> String {
         "test_duration_secs": summary.test_duration_secs,
         "throughput_tx_per_sec": summary.throughput_tx_per_sec,
         "total_errors": summary.total_errors,
+        "clock_offset_ms": summary.clock_offset_ms,
         "per_endpoint": per_endpoint,
     });
 

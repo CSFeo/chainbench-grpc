@@ -61,6 +61,7 @@ fn two_endpoint_race_full_pipeline() {
                     },
                 ),
             ]),
+            clock_offset_ms: 0.0,
         },
     );
 
@@ -119,6 +120,7 @@ fn backfill_is_excluded_from_realtime_metrics() {
             duration_secs: 1.0,
             total_errors: 0,
             endpoint_runtime: HashMap::new(),
+            clock_offset_ms: 0.0,
         },
     );
 
