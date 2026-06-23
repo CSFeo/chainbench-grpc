@@ -16,8 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pin to the version in rust-toolchain.toml so rustfmt/clippy components
+      # are installed for the toolchain cargo actually selects.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt, clippy
 
