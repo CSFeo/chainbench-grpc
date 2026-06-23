@@ -368,37 +368,47 @@ the benchmarking engine can be embedded without shelling out to the binary.
 chainbench-grpc = { git = "https://github.com/CSFeo/chainbench-grpc" }
 ```
 
+The code is organized into `domain` / `application` / `infrastructure` /
+`presentation` layers (see [ARCHITECTURE.md](ARCHITECTURE.md)).
+
 ```rust
 use std::collections::HashMap;
-use chainbench_grpc::analysis::{compute_run_summary, RunMetadata};
-use chainbench_grpc::collector::Comparator;
+use chainbench_grpc::domain::analysis::{compute_run_summary, RunMetadata};
+use chainbench_grpc::domain::collector::Comparator;
+use chainbench_grpc::presentation::output;
 
 let comparator = Comparator::new();
 // ... drive comparator.record_observation(...) from your own collection loop ...
 let summary = compute_run_summary(
     &comparator,
     &["endpoint-1".to_string()],
-    RunMetadata { duration_secs: 10.0, total_errors: 0, endpoint_runtime: HashMap::new() },
+    RunMetadata {
+        duration_secs: 10.0,
+        total_errors: 0,
+        endpoint_runtime: HashMap::new(),
+        clock_offset_ms: 0.0,
+    },
 );
-println!("{}", chainbench_grpc::output::output_json(&summary));
+println!("{}", output::output_json(&summary));
 ```
 
-Key entry points: [`analysis::compute_run_summary`], [`providers::create_provider`],
-[`slots::run_slot_benchmark`], [`throughput::run_throughput`], and the
-`output` / `html` renderers.
+Key entry points: `domain::analysis::compute_run_summary`,
+`infrastructure::geyser::create_provider`, `application::run::run_comparison`,
+`application::slots::run_slot_benchmark`, `application::throughput::run_throughput`,
+and the `presentation::{output, html}` renderers.
 
 ## Development
 
 ```bash
-cargo test                              # 23 tests (unit + integration)
+cargo test                              # 28 tests (unit + integration)
 cargo fmt --all -- --check              # formatting
 cargo clippy --all-targets -- -D warnings   # lints (zero warnings)
 cargo build --release
 ```
 
-Tests include unit coverage for the analysis/collector/timing logic plus two
-integration tests: a public-API pipeline test and a full **mock Yellowstone gRPC
-server** test (`tests/mock_server.rs`) that drives the real provider end to end.
+Tests include unit coverage for the domain/infra logic plus two integration
+tests: a public-API pipeline test and a full **mock Yellowstone gRPC server**
+test (`tests/mock_server.rs`) that drives the real provider end to end.
 
 CI (`.github/workflows/ci.yml`) runs fmt + clippy + test + release build on every
 push and PR. Tagging `vX.Y.Z` triggers `release.yml`, which builds binaries for
@@ -406,26 +416,36 @@ linux x64/arm64 and macOS x64/arm64 and attaches them to a GitHub Release.
 
 ## Architecture
 
+Layered, with dependencies pointing inward (`domain` depends on nothing). Full
+detail — module map, ubiquitous language, run flow — in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
 ```
 src/
-├── lib.rs            # Library root — re-exports the modules below
-├── main.rs           # Thin CLI (clap), mode dispatch, orchestration
-├── config.rs         # TOML config + CLI flag parsing
-├── timing.rs         # Server-side timestamp extraction
-├── warmup.rs         # Warmup phase guard
-├── collector.rs      # DashMap comparator + transaction accumulator
-├── analysis.rs       # Win rate, latency, percentiles, composite score
-├── output.rs         # Console tables, JSON, CSV formatters
-├── html.rs           # Standalone HTML report generator
-├── throughput.rs     # Throughput measurement mode
-├── slots.rs          # Slot lifecycle tracking (6 stages, with reconnection)
-├── proto.rs          # Generated protobuf modules
-└── providers/
-    ├── mod.rs                # GeyserProvider trait + factory + ProviderStats
-    ├── yellowstone.rs        # Yellowstone provider (reconnection + backoff)
-    └── yellowstone_client.rs # gRPC client wrapper (TLS + x-token auth)
+├── lib.rs            # Library root (layer declarations + crate docs)
+├── main.rs           # Composition root: CLI + wiring + renderer selection
+├── domain/           # Pure model + logic (no I/O)
+│   ├── analysis.rs   #   summaries, percentiles, win-rate, skew/backfill
+│   ├── scoring.rs    #   composite 0–100 score
+│   ├── collector.rs  #   Comparator + accumulator
+│   ├── timing.rs     #   observation value objects
+│   ├── clock.rs      #   clock-offset value object + formula
+│   ├── config.rs     #   BenchConfig / Endpoint value objects
+│   └── warmup.rs
+├── application/      # Use-case pipelines
+│   ├── run.rs        #   race / latency / full
+│   ├── slots.rs      #   slot lifecycle
+│   └── throughput.rs
+├── infrastructure/   # I/O adapters
+│   ├── geyser/       #   provider trait + Yellowstone provider + gRPC client
+│   ├── proto.rs      #   generated protobuf
+│   ├── sntp.rs       #   NTP clock probe (UDP)
+│   └── config_file.rs#   TOML loading
+└── presentation/     # Renderers
+    ├── output.rs     #   console / JSON / CSV
+    └── html.rs       #   standalone HTML report
 tests/
-├── pipeline.rs       # End-to-end test via the public library API
+├── pipeline.rs       # End-to-end test via the public domain API
 └── mock_server.rs    # Real provider driven against an in-process mock server
 ```
 

@@ -30,8 +30,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pin to rust-toolchain.toml so the matrix target's std is installed for
+      # the toolchain cargo selects.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.90.0
         with:
           targets: ${{ matrix.target }}
 

@@ -1,24 +1,35 @@
 //! chainbench-grpc — Solana Yellowstone gRPC benchmarking library.
 //!
-//! The CLI binary is a thin wrapper over these modules. They are exposed as a
-//! library so the benchmarking engine can be embedded (e.g. inside ChainBench)
-//! without shelling out to the binary.
+//! The codebase is organized into layers with dependencies pointing **inward**:
 //!
-//! Key entry points:
-//! - [`analysis::compute_run_summary`] — turn collected observations into a [`analysis::RunSummary`]
-//! - [`providers::create_provider`] — build a [`providers::GeyserProvider`] for an endpoint
-//! - [`slots::run_slot_benchmark`] / [`throughput::run_throughput`] — the standalone mode pipelines
-//! - [`output`] / [`html`] — render a summary to console/JSON/CSV/HTML
+//! - [`domain`] — the benchmarking model and pure logic: observations, the
+//!   comparator, latency/percentile/scoring analysis, the clock-offset formula,
+//!   and configuration value objects. Depends on nothing else in the crate.
+//! - [`application`] — use-case pipelines that orchestrate a run (race/latency/
+//!   full, slots, throughput). Depends on `domain` and `infrastructure`.
+//! - [`infrastructure`] — I/O adapters: the Yellowstone gRPC provider/client,
+//!   the generated protobuf, the SNTP clock probe, and TOML config loading.
+//!   Depends on `domain`.
+//! - [`presentation`] — renderers (console/JSON/CSV/HTML). Depends on `domain`
+//!   and `application` result types.
+//!
+//! The binary (`main.rs`) is the composition root: it parses the CLI, wires the
+//! layers together, and selects a renderer.
+//!
+//! ## Ubiquitous language
+//! - **Endpoint** — a gRPC provider under test.
+//! - **Observation** — one endpoint receiving one transaction signature, with
+//!   server (`created_at`) and client timestamps ([`domain::timing`]).
+//! - **Comparator** — aggregates observations per signature across endpoints
+//!   ([`domain::collector`]).
+//! - **Run / Summary** — a completed benchmark and its computed metrics
+//!   ([`domain::analysis`]).
+//! - **Provider** — an adapter that streams observations from an endpoint
+//!   ([`infrastructure::geyser`]).
+//! - **Clock offset** — host-vs-UTC skew used to correct absolute latency
+//!   ([`domain::clock`], probed by [`infrastructure::sntp`]).
 
-pub mod analysis;
-pub mod clock;
-pub mod collector;
-pub mod config;
-pub mod html;
-pub mod output;
-pub mod proto;
-pub mod providers;
-pub mod slots;
-pub mod throughput;
-pub mod timing;
-pub mod warmup;
+pub mod application;
+pub mod domain;
+pub mod infrastructure;
+pub mod presentation;

@@ -5,7 +5,7 @@ use std::{
 };
 use tracing::info;
 
-use crate::timing::TransactionData;
+use crate::domain::timing::TransactionData;
 
 /// Thread-safe concurrent comparator for multi-endpoint transaction tracking.
 /// Adapted from GeyserBench's Comparator with extended timestamp support.
@@ -177,7 +177,7 @@ impl ProgressTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timing::{TimestampSource, TransactionData};
+    use crate::domain::timing::{TimestampSource, TransactionData};
     use std::time::Duration;
 
     fn tx(elapsed_ms: u64) -> TransactionData {

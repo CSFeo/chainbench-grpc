@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-15
+
+Layered (DDD-style) architecture refactor. **No behavioral change** — all 28
+tests pass unchanged — but the internal structure and the public module paths
+moved, so this is a breaking change for library consumers.
+
+### Changed
+- Reorganized `src/` into four layers with dependencies pointing inward:
+  `domain` (model + pure logic), `application` (use-case pipelines),
+  `infrastructure` (gRPC/NTP/TOML adapters), `presentation` (renderers). See
+  the new [ARCHITECTURE.md](ARCHITECTURE.md).
+- **Public API paths moved** for library users, e.g. `chainbench_grpc::analysis`
+  → `chainbench_grpc::domain::analysis`, `chainbench_grpc::providers` →
+  `chainbench_grpc::infrastructure::geyser`, `output`/`html` →
+  `chainbench_grpc::presentation::*`.
+- Split mixed modules onto layer boundaries: clock math (`domain::clock`) vs NTP
+  probe (`infrastructure::sntp`); config value objects (`domain::config`) vs TOML
+  loading (`infrastructure::config_file`); the protobuf `created_at` extraction
+  and commitment conversion moved into `infrastructure::geyser` so `domain` no
+  longer depends on generated protobuf; race/latency/full orchestration extracted
+  from `main` into `application::run`; slot/throughput console renderers moved to
+  `presentation::output`.
+
+### Removed (dead code)
+- `BenchConfig.duration_secs` (written, never read).
+- Unused dependencies `chrono` and a duplicate `tokio-stream` (kept as a
+  dev-dependency for tests).
+- Dead `GeyserGrpcClient::subscribe_with_request` branch + the orphaned
+  `SubscribeSendError` error variant.
+
 ## [0.3.0] - 2026-06-15
 
 Clock-offset correction for absolute latency (TS1 clock-skew design, Tier 1).

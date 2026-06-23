@@ -1,22 +1,13 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize},
-    },
-    time::Instant,
-};
-
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::sync::broadcast;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use chainbench_grpc::{analysis, clock, config, html, output, slots, throughput, timing};
-
-use chainbench_grpc::collector::{Comparator, ProgressTracker};
-use chainbench_grpc::config::ConfigToml;
-use chainbench_grpc::providers::{ProviderContext, create_provider};
-use chainbench_grpc::warmup::WarmupGuard;
+use chainbench_grpc::application::run::{ComparisonRun, run_comparison};
+use chainbench_grpc::application::{slots, throughput};
+use chainbench_grpc::domain::config;
+use chainbench_grpc::infrastructure::config_file::ConfigToml;
+use chainbench_grpc::infrastructure::sntp;
+use chainbench_grpc::presentation::{html, output};
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
@@ -176,7 +167,7 @@ async fn resolve_clock_offset(cli: &Cli) -> (f64, &'static str) {
     if let Some(off) = cli.clock_offset_ms {
         return (off, "manual");
     }
-    match tokio::task::spawn_blocking(|| clock::measure_clock_offset(clock::DEFAULT_NTP_SERVERS))
+    match tokio::task::spawn_blocking(|| sntp::measure_clock_offset(sntp::DEFAULT_NTP_SERVERS))
         .await
     {
         Ok(Some(c)) => {
@@ -256,7 +247,6 @@ async fn main() {
             account: cli.account.clone(),
             commitment,
             warmup_secs: cli.warmup,
-            duration_secs: None,
         };
         (bench, endpoints)
     } else if let Some(config_path) = &cli.config {
@@ -310,7 +300,7 @@ async fn main() {
                 .await;
 
         match cli.output {
-            OutputFormat::Console => slots::display_slot_console(&result),
+            OutputFormat::Console => output::display_slot_console(&result),
             OutputFormat::Json => {
                 println!(
                     "{}",
@@ -318,7 +308,7 @@ async fn main() {
                 );
             }
             OutputFormat::Csv => {
-                slots::display_slot_console(&result);
+                output::display_slot_console(&result);
             }
             OutputFormat::Html => {
                 write_html_report(html::render_slots(&result));
@@ -342,8 +332,8 @@ async fn main() {
         let result = throughput::run_throughput(endpoints, bench_config, *duration).await;
 
         match cli.output {
-            OutputFormat::Console => throughput::display_throughput_console(&result),
-            OutputFormat::Json => println!("{}", throughput::output_throughput_json(&result)),
+            OutputFormat::Console => output::display_throughput_console(&result),
+            OutputFormat::Json => println!("{}", output::output_throughput_json(&result)),
             OutputFormat::Csv => println!("{}", output::throughput_to_csv(&result)),
             OutputFormat::Html => {
                 write_html_report(html::render_throughput(&result));
@@ -398,127 +388,18 @@ async fn main() {
     }
     println!();
 
-    // Setup shared state
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let comparator = Arc::new(Comparator::new());
-    let warmup_guard = Arc::new(WarmupGuard::new(bench_config.warmup_secs));
-    let shared_counter = Arc::new(AtomicUsize::new(0));
-    let shared_shutdown = Arc::new(AtomicBool::new(false));
-
-    let target = if bench_config.transactions > 0 {
-        Some(bench_config.transactions as usize)
-    } else {
-        None
-    };
-
-    let progress = target.map(|t| Arc::new(ProgressTracker::new(t)));
-    let total_producers = endpoints.len();
-
-    let start_wallclock_ms = timing::get_current_timestamp_ms();
-    let start_instant = Instant::now();
-
-    // Spawn provider tasks
-    let mut handles = Vec::new();
-    let endpoint_names: Vec<String> = endpoints.iter().map(|e| e.name.clone()).collect();
-
-    for ep in endpoints {
-        let provider = create_provider(&ep.kind);
-        let ctx = ProviderContext {
-            shutdown_tx: shutdown_tx.clone(),
-            shutdown_rx: shutdown_tx.subscribe(),
-            start_wallclock_ms,
-            start_instant,
-            comparator: Arc::clone(&comparator),
-            warmup: Arc::clone(&warmup_guard),
-            shared_counter: Arc::clone(&shared_counter),
-            shared_shutdown: Arc::clone(&shared_shutdown),
-            target_transactions: target,
-            total_producers,
-            progress: progress.clone(),
-        };
-        handles.push(provider.process(ep, bench_config.clone(), ctx));
-    }
-
-    // Ctrl+C handler
-    let ctrl_shutdown_tx = shutdown_tx.clone();
-    let ctrl_shared_shutdown = Arc::clone(&shared_shutdown);
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("Ctrl+C received, shutting down...");
-            ctrl_shared_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = ctrl_shutdown_tx.send(());
-        }
-    });
-
-    // Safety timeout
-    let timeout_shutdown_tx = shutdown_tx.clone();
-    let timeout_shared_shutdown = Arc::clone(&shared_shutdown);
-    let max_duration = cli.max_duration;
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(max_duration)).await;
-        if !timeout_shared_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            info!("Max duration {}s reached, forcing shutdown", max_duration);
-            eprintln!(
-                "\n  Warning: max duration {}s reached. Use --max-duration to increase.",
-                max_duration
-            );
-            timeout_shared_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = timeout_shutdown_tx.send(());
-        }
-    });
-
-    // Wait for all providers, collect per-endpoint runtime stats, count errors
-    let mut total_errors = 0usize;
-    let mut endpoint_runtime: std::collections::HashMap<String, analysis::EndpointRuntime> =
-        std::collections::HashMap::new();
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(stats)) => {
-                endpoint_runtime.insert(
-                    stats.endpoint_name.clone(),
-                    analysis::EndpointRuntime {
-                        reconnect_count: stats.reconnect_count,
-                        warmup_skipped: stats.warmup_skipped,
-                    },
-                );
-            }
-            Ok(Err(e)) => {
-                error!("Provider error: {}", e);
-                total_errors += 1;
-            }
-            Err(e) => {
-                error!("Provider task panicked: {}", e);
-                total_errors += 1;
-            }
-        }
-    }
-
-    let test_duration = start_instant.elapsed();
-    let warmup_duration = bench_config.warmup_secs as f64;
-    let collection_duration = test_duration.as_secs_f64() - warmup_duration;
-
-    // Compute and display results
-    let metadata = analysis::RunMetadata {
-        duration_secs: collection_duration.max(0.0),
-        total_errors,
-        endpoint_runtime,
+    let summary = run_comparison(ComparisonRun {
+        endpoints,
+        config: bench_config,
+        max_duration_secs: cli.max_duration,
         clock_offset_ms,
-    };
-
-    let summary = analysis::compute_run_summary(&comparator, &endpoint_names, metadata);
+    })
+    .await;
 
     match cli.output {
-        OutputFormat::Console => {
-            output::display_console(&summary, show_race, show_latency);
-        }
-        OutputFormat::Json => {
-            println!("{}", output::output_json(&summary));
-        }
-        OutputFormat::Csv => {
-            println!("{}", output::output_csv(&summary));
-        }
-        OutputFormat::Html => {
-            write_html_report(html::render_run_summary(&summary));
-        }
+        OutputFormat::Console => output::display_console(&summary, show_race, show_latency),
+        OutputFormat::Json => println!("{}", output::output_json(&summary)),
+        OutputFormat::Csv => println!("{}", output::output_csv(&summary)),
+        OutputFormat::Html => write_html_report(html::render_run_summary(&summary)),
     }
 }
