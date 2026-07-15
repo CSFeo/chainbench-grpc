@@ -2,7 +2,7 @@
 
 Comprehensive Solana gRPC (Yellowstone Geyser) benchmarking tool. Compare endpoint performance, measure latency, track slot lifecycle stages, and generate shareable reports.
 
-Built from the ground up combining best practices from [GeyserBench](https://github.com/solstackapp/geyserbench), [Yellowstone Thorofare](https://github.com/rpcpool/yellowstone-thorofare), [Dysnix solana-test](https://github.com/dysnix/solana-test), and [Shyft grpc-latency-checker](https://github.com/Shyft-to/solana-defi).
+A single self-contained binary that measures absolute latency (from server `created_at` timestamps), relative win-rate racing across any number of endpoints, throughput, and slot-lifecycle timing — with reproducible reports in console, JSON, CSV, and HTML.
 
 ## Features
 
